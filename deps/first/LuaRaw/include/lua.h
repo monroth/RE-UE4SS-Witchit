@@ -523,5 +523,11 @@ void LuaLock(lua_State* L);
 void LuaUnlock(lua_State* L);
 void LuaLockInitial(lua_State* L);
 void LuaLockFinal(lua_State* L);
+/* Private embedded-host thread metadata notices. No consumer Lua API export. */
+typedef int (*LuaHostThreadNotice)(lua_State* parent, lua_State* child, lua_Hook inherited, int born);
+int LuaHostInstallThreadNotice(LuaHostThreadNotice);
+void LuaHostThreadBorn(lua_State*, lua_State*);
+void LuaHostThreadFree(lua_State*, lua_State*);
+
 
 #endif

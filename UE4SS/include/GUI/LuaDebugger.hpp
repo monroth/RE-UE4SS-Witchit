@@ -1,4 +1,5 @@
 #pragma once
+#include <LuaHost/Lifecycle.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -14,7 +15,6 @@
 
 #include <File/Macros.hpp>
 #include <TextEditor.h>
-#include <GUI/Mods.hpp>
 
 struct lua_State;
 struct lua_Debug;
@@ -160,6 +160,8 @@ namespace RC::GUI
         int m_selected_error_index{-1};
         // Do not use! Call get_selected_state instead to make sure it's valid!
         lua_State* m_selected_state{nullptr};
+        size_t m_selected_mod_id{};
+        LuaHost::VmHandle m_selected_vm{};
         // The name and type of the selected state, valid even if the state no longer exists.
         // Used to reselect the state when appropriate.
         std::string m_selected_state_name{};
@@ -195,6 +197,7 @@ namespace RC::GUI
 
         // Track which states have debug hooks installed
         std::set<lua_State*> m_states_with_hooks;
+        mutable std::mutex m_hooks_mutex;
 
         // Script viewer (for Debug view)
         std::unordered_map<std::string, LuaScriptFile> m_script_cache;
@@ -232,11 +235,6 @@ namespace RC::GUI
 
         // Stack frame expansion state (-1 = no change, 0 = collapse all, 1 = expand all)
         int m_stack_frames_expand_action{-1};
-
-        ModsWidget m_mods_widget{.m_handler_context = this,
-                                 .m_create_new_mod_button_handler = &create_new_mod,
-                                 .m_create_file_button_handler = &create_new_file,
-                                 .m_open_button_handler = &open_mod};
 
     public:
         LuaDebugger();
@@ -309,6 +307,7 @@ namespace RC::GUI
         auto render_controls() -> void;
         auto render_debug_view() -> void;
         auto render_script_editor() -> void;
+        auto render_mods_tab() -> void;
         auto render_breakpoints_panel() -> void;
         auto render_repl() -> void;
         auto render_value_tree(std::vector<LuaValueNode>& nodes) -> void;
@@ -341,11 +340,35 @@ namespace RC::GUI
         // Helper to get table entries at a given path
         static auto get_table_entries_at_path(lua_State* L, const std::string& path) -> std::vector<std::pair<std::string, LuaStackSlot>>;
 
+        // Mod management
+        struct ModInfo
+        {
+            std::string name;
+            std::filesystem::path path;
+            bool enabled_via_txt{false};
+            bool enabled_via_mods_txt{false};
+            bool is_running{false};
+
+            bool is_enabled() const { return enabled_via_txt || enabled_via_mods_txt; }
+        };
+
+        std::vector<ModInfo> m_discovered_mods;
+        std::atomic_bool m_mods_list_dirty{true};
+        std::string m_new_mod_name;
+        bool m_show_create_mod_popup{false};
+        std::string m_new_file_name;
+        bool m_show_create_file_popup{false};
+        bool m_add_require_to_main{true};
+        std::filesystem::path m_create_file_mod_path;
         int m_pending_editor_tab_switch{-1};
 
-        static auto create_new_mod(void* context, const std::string& name) -> bool;
-        static auto create_new_file(void* context, const std::string& mod_path, const std::string& filename, bool add_require_to_main) -> bool;
-        static auto open_mod(void* context, ModInfo& mod) -> void;
+        auto refresh_mods_list() -> void;
+        auto create_new_mod(const std::string& name) -> bool;
+        auto create_new_file(const std::string& mod_path, const std::string& filename, bool add_require_to_main) -> bool;
+        auto set_mod_enabled(const std::filesystem::path& mod_path, bool enabled) -> void;
+        auto restart_mod_by_name(const std::string& mod_name) -> void;
+        auto uninstall_mod_by_name(const std::string& mod_name) -> void;
+        auto start_mod_by_path(const std::filesystem::path& mod_path) -> void;
     };
 
 } // namespace RC::GUI

@@ -4,6 +4,8 @@
 #include <LuaType/LuaUObject.hpp>
 #include <LuaType/LuaUStruct.hpp>
 
+namespace RC::LuaHost { struct LuaObjectTypeAccess; }
+
 namespace RC::Unreal
 {
     class UClass;
@@ -20,6 +22,7 @@ namespace RC::LuaType
     };
     class UClass : public UObjectBase<Unreal::UClass, UClassName>
     {
+        friend struct RC::LuaHost::LuaObjectTypeAccess;
       private:
         explicit UClass(Unreal::UClass* object);
 

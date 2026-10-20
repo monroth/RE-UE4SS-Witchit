@@ -4,6 +4,11 @@
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <LuaLibrary.hpp>
 #include <LuaMadeSimple/LuaMadeSimple.hpp>
+#include <LuaMadeSimple/HostExecutionHooks.hpp>
+#include <LuaMadeSimple/HostThreadAccess.hpp>
+#include <LuaHost/HostBindings.hpp>
+#include <memory>
+#include <optional>
 #include <SigScanner/SinglePassSigScanner.hpp>
 #include <Signatures.hpp>
 #include <ExceptionHandling.hpp>
@@ -19,6 +24,8 @@
 #include <Unreal/UnrealInitializer.hpp>
 
 #include <Helpers/String.hpp>
+extern "C" void LuaLock(lua_State*);
+extern "C" void LuaUnlock(lua_State*);
 
 // Required for SEH_TRY and SEH_EXCEPT.
 #ifdef _WIN32
@@ -28,6 +35,31 @@
 
 namespace RC
 {
+    namespace {
+        // A scan retains its actual host-created VM until all scanner workers
+        // complete. Destruction performs pure bookkeeping only.
+        struct SignatureLuaVm {
+            const LuaMadeSimple::Lua* lua{};
+            lua_State* root{};
+            LuaHost::VmHandle vm{};
+            bool closed{};
+            void close() {
+                if (closed) return;
+                auto& host=LuaHost::HostBindings::instance();
+                if(host.claim_vm_close(vm)!=LuaHost::Status::ready)
+                    throw std::runtime_error("Signature VM still executing at scan completion");
+                LuaMadeSimple::LuaFinalizationScope finalizing{root,root};
+                if(host.cleanup_vm(vm)!=LuaHost::Status::ok)
+                    throw std::runtime_error("Signature VM cleanup failed");
+                lua_close(root);
+                finalizing.close_completed();
+                if(host.finish_vm_close(vm)!=LuaHost::Status::ok)
+                    throw std::runtime_error("Signature VM metadata finalization failed");
+                LuaMadeSimple::forget_closed_host_vm(root);
+                closed=true;
+            }
+        };
+    }
     auto scan_complete_default_func(DidLuaScanSucceed) -> void
     {
     }
@@ -37,13 +69,36 @@ namespace RC
                               LuaScriptMatchFoundFunc& match_found_func,
                               LuaScriptScanCompleteFunc& scan_complete_func) -> void
     {
-        const LuaMadeSimple::Lua& lua = LuaMadeSimple::new_state();
+        auto owned=std::make_shared<SignatureLuaVm>();
+        owned->lua=&LuaMadeSimple::new_state();
+        owned->root=owned->lua->get_lua_state();
+        const auto binding=LuaHost::HostBindings::instance().attach_vm(owned->root);
+        owned->vm=binding.value;
+        if(binding.status!=LuaHost::Status::ok) {
+            if(owned->vm.id) owned->close();
+            else {
+                // No host record was published and no library/userdata setup
+                // ran. Keep the real gate through close and cache invalidation.
+                LuaLock(nullptr);
+                lua_close(owned->root);
+                LuaMadeSimple::forget_closed_host_vm(owned->root);
+                LuaUnlock(nullptr);
+                owned->closed=true;
+            }
+            throw std::runtime_error("Signature VM ownership binding failed");
+        }
+        const LuaMadeSimple::Lua& lua=*owned->lua;
+        try {
+        std::optional<void*> immediate;
+        std::string signature;
+        constexpr const char* global_register_func_name = "Register";
+        constexpr const char* global_on_match_found_func_name = "OnMatchFound";
+        {
+        LuaMadeSimple::LuaExecutionScope execution{owned->root,owned->root};
 
         lua.open_all_libs();
         lua.register_function("Print", LuaLibrary::global_print);
         lua.register_function("print", LuaLibrary::global_print);
-        lua.register_function("PrintLn", LuaLibrary::global_println);
-        lua.register_function("println", LuaLibrary::global_println);
         lua.register_function("DerefToInt32", LuaLibrary::deref_to_int32);
         lua.register_function("dereftoint32", LuaLibrary::deref_to_int32);
         lua.register_function("LoadExport", LuaLibrary::load_export);
@@ -56,8 +111,7 @@ namespace RC
             if (lua.is_integer())
             {
                 auto found_address = reinterpret_cast<void*>(lua.get_integer());
-                match_found_func(found_address);
-                return;
+                immediate=found_address;
             }
             else if (lua.is_nil())
             {
@@ -65,9 +119,7 @@ namespace RC
             }
         }
 
-        constexpr const char* global_register_func_name = "Register";
-        constexpr const char* global_on_match_found_func_name = "OnMatchFound";
-
+        if(!immediate.has_value()) {
         if (!lua.is_global_function(global_register_func_name) || !lua.is_global_function(global_on_match_found_func_name))
         {
             Output::send(STR("Lua functions 'Register' and 'OnMatchFound' must be "
@@ -83,12 +135,23 @@ namespace RC
             throw std::runtime_error{"Lua function 'Register' must return a string "
                                      "that contains the signature to scan for"};
         }
+        signature=std::string(lua.get_string()); // copy while actual VM/gate is pinned
+        }
+        }
+        if(immediate.has_value()) {
+            owned->close();
+            match_found_func(*immediate);
+            return;
+        }
 
         signature_containers.emplace_back(SignatureContainer{{
-                                                                     {lua.get_string().data()},
+                                                                     {signature},
                                                              },
                                                              // On Match Found
-                                                             [&lua, match_found_func](SignatureContainer& self) -> bool {
+                                                             [owned, match_found_func](SignatureContainer& self) -> bool {
+                                                                 if(owned->closed) return false;
+                                                                 LuaMadeSimple::LuaExecutionScope execution{owned->root,owned->root};
+                                                                 const auto& lua=*owned->lua;
                                                                  lua.prepare_function_call(global_on_match_found_func_name);
                                                                  lua.set_integer(reinterpret_cast<uintptr_t>(static_cast<void*>(self.get_match_address())));
                                                                  lua.call_function(1, 1);
@@ -117,11 +180,15 @@ namespace RC
                                                                  }
                                                              },
                                                              // On Scan Completed
-                                                             [scan_complete_func]([[maybe_unused]] const SignatureContainer& self) {
+                                                             [owned, scan_complete_func]([[maybe_unused]] const SignatureContainer& self) {
+                                                                 // Actual scanner waits all worker futures before this callback.
+                                                                 owned->close();
                                                                  scan_complete_func(self.get_did_succeed() ? DidLuaScanSucceed::Yes : DidLuaScanSucceed::No);
                                                              }});
-
-        // lua_close(lua.get_lua_state());
+        } catch (...) {
+            owned->close();
+            throw;
+        }
     }
 
     auto setup_lua_scan_overrides(std::filesystem::path& working_directory, Unreal::UnrealInitializer::Config& config) -> void

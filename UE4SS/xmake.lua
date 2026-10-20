@@ -62,9 +62,11 @@ target(projectName)
     add_includedirs("include", { public = true })
     add_includedirs("generated_include", { public = true })
     add_headerfiles("include/**.hpp")
+    add_headerfiles("include/**.h")
     add_headerfiles("generated_include/*.hpp")
 
     add_files("src/**.cpp")
+    add_files("src/LuaHost/LuaValueFrame.c", "src/LuaHost/LuaEntryFrame.c", "src/LuaHost/LuaReferenceFrame.c", "src/LuaHost/LuaCallbackFrame.c", "src/LuaHost/LuaTokenFrame.c", "src/LuaHost/LuaObjectFrame.c", "src/LuaHost/LuaThreadFrame.c", "src/LuaHost/LuaNativeFrame.c", "src/LuaHost/LuaOwnedUserdataFrame.c")
 
     add_deps(
         "File", "DynamicOutput", "Unreal",

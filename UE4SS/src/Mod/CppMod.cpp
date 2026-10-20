@@ -7,6 +7,8 @@
 #include <Helpers/SysError.hpp>
 #include <Helpers/String.hpp>
 #include <Mod/CppMod.hpp>
+#include <LuaHost/HostBindings.hpp>
+#include <LuaMadeSimple/LuaMadeSimple.hpp>
 
 namespace RC
 {
@@ -62,14 +64,25 @@ namespace RC
             set_installable(false);
             return;
         }
+        auto owner = LuaHost::HostBindings::instance().attach_module(m_main_dll_module);
+        if (owner.status != LuaHost::Status::ok)
+        {
+            FreeLibrary(m_main_dll_module);
+            m_main_dll_module = NULL;
+            set_installable(false);
+            return;
+        }
+        m_host_module = owner.value;
     }
 
     auto CppMod::start_mod() -> void
     {
         try
         {
-            m_mod = m_start_mod_func();
-            m_is_started = m_mod != nullptr;
+            LuaHost::HostBindings::instance().api().dispatch_code(m_host_module, [&] {
+                m_mod.store(m_start_mod_func(), std::memory_order_release);
+            });
+            m_is_started = m_mod.load(std::memory_order_acquire) != nullptr;
         }
         catch (std::exception& e)
         {
@@ -87,13 +100,96 @@ namespace RC
         }
     }
 
+    auto CppMod::host_retirement_complete() const -> bool
+    {
+        return !m_host_module.id || m_host_retired.load(std::memory_order_acquire);
+    }
+
+    auto CppMod::host_retirement_requested() const -> bool
+    {
+        return !host_retirement_complete() &&
+               LuaHost::HostBindings::instance().module_is_retiring(m_host_module);
+    }
+
+    auto CppMod::run_code(const std::function<void(CppUserModBase&)>& callback) -> void
+    {
+        LuaHost::HostBindings::instance().api().dispatch_code(m_host_module, [&] {
+            if (auto* mod = m_mod.load(std::memory_order_acquire)) callback(*mod);
+        });
+    }
+
+    auto CppMod::run_lua(const LuaMadeSimple::Lua& lua, const std::function<void(CppUserModBase&)>& callback) -> void
+    {
+        auto& host = LuaHost::HostBindings::instance();
+        auto* root = lua.get_root_lua_state();
+        auto vm = host.find_vm(root);
+        if (vm.status != LuaHost::Status::ok) return;
+        auto stack = host.stack_binding(root, lua.get_lua_state());
+        if (stack.status != LuaHost::Status::ok) return;
+        host.api().dispatch_lua(vm.value, m_host_module, stack.value, [&](auto) {
+            if (auto* mod = m_mod.load(std::memory_order_acquire)) callback(*mod);
+            return ue4ss_lua_host_status{UE4SS_LUA_HOST_OK};
+        });
+    }
+
     auto CppMod::uninstall() -> void
     {
-        Output::send(STR("Stopping C++ mod '{}' for uninstall\n"), m_mod_name);
-        if (m_mod && m_uninstall_mod_func)
-        {
-            m_uninstall_mod_func(m_mod);
-        }
+        if (host_retirement_complete() || m_host_uninstall_failed || m_host_uninstall_running) return;
+        auto& host = LuaHost::HostBindings::instance();
+        // Pending returns immediately. The program keeps the CppMod object and
+        // DLL alive and retries on its event thread after existing leases drain.
+        if (host.claim_module_retire(m_host_module) != LuaHost::Status::ready) return;
+        struct Running {
+            bool& flag;
+            explicit Running(bool& value) : flag(value) { flag = true; }
+            ~Running() { flag = false; }
+        } running{m_host_uninstall_running};
+        bool cleaned{};
+        host.api().dispatch_finalizer(m_host_module, [&] {
+            if (host.cleanup_module(m_host_module) != LuaHost::Status::ok) return;
+            cleaned = true;
+            Output::send(STR("Stopping C++ mod '{}' for uninstall\n"), m_mod_name);
+            m_is_started = false;
+            if (!m_host_uninstall_called)
+            {
+                m_host_uninstall_called = true;
+                try
+                {
+                    if (auto* mod = m_mod.load(std::memory_order_acquire); mod && m_uninstall_mod_func)
+                        m_uninstall_mod_func(mod);
+                    m_mod.store(nullptr, std::memory_order_release);
+                }
+                catch (...)
+                {
+                    // Never retry a potentially partial consumer deletion or unload
+                    // its code after an unconfirmed teardown.
+                    m_host_uninstall_failed = true;
+                    Output::send<LogLevel::Error>(STR("C++ mod '{}' threw during uninstall; DLL retained\n"), m_mod_name);
+                    return;
+                }
+            }
+            if (!cleaned || m_host_uninstall_failed) return;
+            if (m_main_dll_module)
+            {
+                if (!FreeLibrary(m_main_dll_module))
+                {
+                    m_host_uninstall_failed = true;
+                    Output::send<LogLevel::Error>(STR("C++ mod '{}' DLL unload failed; finalization retained\n"), m_mod_name);
+                    return;
+                }
+                m_main_dll_module = NULL;
+            }
+            if (m_dlls_path_cookie)
+            {
+                RemoveDllDirectory(m_dlls_path_cookie);
+                m_dlls_path_cookie = nullptr;
+            }
+        });
+        if (!cleaned || m_host_uninstall_failed) return;
+        m_start_mod_func = nullptr;
+        m_uninstall_mod_func = nullptr;
+        if (host.finish_module_retire(m_host_module) == LuaHost::Status::ok)
+            m_host_retired.store(true, std::memory_order_release);
     }
 
     auto CppMod::fire_on_lua_start(StringViewType mod_name,
@@ -102,19 +198,20 @@ namespace RC
                                    LuaMadeSimple::Lua& async_lua,
                                    LuaMadeSimple::Lua* hook_lua) -> void
     {
-        if (m_mod)
-        {
+        run_lua(lua, [&](CppUserModBase& mod) {
             // Call new API
-            m_mod->on_lua_start(mod_name, lua, main_lua, async_lua, hook_lua);
+            mod.on_lua_start(mod_name, lua, main_lua, async_lua, hook_lua);
 
+            ue4ss_lua_host_context_info_v1 active{1, sizeof(active), {}, {}, {}};
+            if (LuaHost::HostApiRuntime::table().current_context(&active) != UE4SS_LUA_HOST_OK) return;
             // Call old deprecated API for backwards compatibility
             std::vector<LuaMadeSimple::Lua*> hook_luas;
             if (hook_lua)
             {
                 hook_luas.push_back(hook_lua);
             }
-            m_mod->on_lua_start(mod_name, lua, main_lua, async_lua, hook_luas);
-        }
+            mod.on_lua_start(mod_name, lua, main_lua, async_lua, hook_luas);
+        });
     }
 
     auto CppMod::fire_on_lua_start(LuaMadeSimple::Lua& lua,
@@ -122,19 +219,20 @@ namespace RC
                                    LuaMadeSimple::Lua& async_lua,
                                    LuaMadeSimple::Lua* hook_lua) -> void
     {
-        if (m_mod)
-        {
+        run_lua(lua, [&](CppUserModBase& mod) {
             // Call new API
-            m_mod->on_lua_start(lua, main_lua, async_lua, hook_lua);
+            mod.on_lua_start(lua, main_lua, async_lua, hook_lua);
 
+            ue4ss_lua_host_context_info_v1 active{1, sizeof(active), {}, {}, {}};
+            if (LuaHost::HostApiRuntime::table().current_context(&active) != UE4SS_LUA_HOST_OK) return;
             // Call old deprecated API for backwards compatibility
             std::vector<LuaMadeSimple::Lua*> hook_luas;
             if (hook_lua)
             {
                 hook_luas.push_back(hook_lua);
             }
-            m_mod->on_lua_start(lua, main_lua, async_lua, hook_luas);
-        }
+            mod.on_lua_start(lua, main_lua, async_lua, hook_luas);
+        });
     }
 
     auto CppMod::fire_on_lua_stop(StringViewType mod_name,
@@ -143,97 +241,100 @@ namespace RC
                                   LuaMadeSimple::Lua& async_lua,
                                   LuaMadeSimple::Lua* hook_lua) -> void
     {
-        if (m_mod)
-        {
+        run_lua(lua, [&](CppUserModBase& mod) {
             // Call new API
-            m_mod->on_lua_stop(mod_name, lua, main_lua, async_lua, hook_lua);
+            mod.on_lua_stop(mod_name, lua, main_lua, async_lua, hook_lua);
 
+            ue4ss_lua_host_context_info_v1 active{1, sizeof(active), {}, {}, {}};
+            if (LuaHost::HostApiRuntime::table().current_context(&active) != UE4SS_LUA_HOST_OK) return;
             // Call old deprecated API for backwards compatibility
             std::vector<LuaMadeSimple::Lua*> hook_luas;
             if (hook_lua)
             {
                 hook_luas.push_back(hook_lua);
             }
-            m_mod->on_lua_stop(mod_name, lua, main_lua, async_lua, hook_luas);
-        }
+            mod.on_lua_stop(mod_name, lua, main_lua, async_lua, hook_luas);
+        });
     }
 
     auto CppMod::fire_on_lua_stop(LuaMadeSimple::Lua& lua, LuaMadeSimple::Lua& main_lua, LuaMadeSimple::Lua& async_lua, LuaMadeSimple::Lua* hook_lua) -> void
     {
-        if (m_mod)
-        {
+        run_lua(lua, [&](CppUserModBase& mod) {
             // Call new API
-            m_mod->on_lua_stop(lua, main_lua, async_lua, hook_lua);
+            mod.on_lua_stop(lua, main_lua, async_lua, hook_lua);
 
+            ue4ss_lua_host_context_info_v1 active{1, sizeof(active), {}, {}, {}};
+            if (LuaHost::HostApiRuntime::table().current_context(&active) != UE4SS_LUA_HOST_OK) return;
             // Call old deprecated API for backwards compatibility
             std::vector<LuaMadeSimple::Lua*> hook_luas;
             if (hook_lua)
             {
                 hook_luas.push_back(hook_lua);
             }
-            m_mod->on_lua_stop(lua, main_lua, async_lua, hook_luas);
-        }
+            mod.on_lua_stop(lua, main_lua, async_lua, hook_luas);
+        });
     }
 
     auto CppMod::fire_unreal_init() -> void
     {
-        if (m_mod)
-        {
-            m_mod->on_unreal_init();
-        }
+        run_code([&](CppUserModBase& mod) {
+            mod.on_unreal_init();
+        });
     }
 
     auto CppMod::fire_ui_init() -> void
     {
-        if (m_mod)
-        {
-            m_mod->on_ui_init();
-        }
+        run_code([&](CppUserModBase& mod) {
+            mod.on_ui_init();
+        });
     }
 
     auto CppMod::fire_program_start() -> void
     {
-        if (m_mod)
-        {
-            m_mod->on_program_start();
-        }
+        run_code([&](CppUserModBase& mod) {
+            mod.on_program_start();
+        });
     }
 
     auto CppMod::fire_update() -> void
     {
-        if (m_mod)
-        {
-            m_mod->on_update();
-        }
+        run_code([&](CppUserModBase& mod) {
+            mod.on_update();
+        });
     }
 
     auto CppMod::fire_dll_load(StringViewType dll_name) -> void
     {
-        if (m_mod)
-        {
-            m_mod->on_dll_load(dll_name);
-        }
+        run_code([&](CppUserModBase& mod) {
+            mod.on_dll_load(dll_name);
+        });
     }
 
     auto CppMod::fire_on_cpp_mods_loaded() -> void
     {
-        if (m_mod)
-        {
-            m_mod->on_cpp_mods_loaded();
-        }
-    }
-
-    auto CppMod::get_user_mod() -> CppUserModBase*
-    {
-        return m_mod;
+        run_code([&](CppUserModBase& mod) {
+            mod.on_cpp_mods_loaded();
+        });
     }
 
     CppMod::~CppMod()
     {
-        if (m_main_dll_module)
+        if (!host_retirement_complete()) uninstall();
+        // Program deletion paths check completion before deleting this object.
+        // Fail closed even if an external legacy deletion violates that rule.
+        if (m_main_dll_module && !m_host_module.id)
         {
             FreeLibrary(m_main_dll_module);
+            m_main_dll_module = NULL;
+        }
+        if (m_main_dll_module)
+        {
+            Output::send<LogLevel::Error>(STR("C++ mod '{}' destroyed before leases drained; DLL retained\n"), m_mod_name);
+        }
+        else if (m_dlls_path_cookie)
+        {
             RemoveDllDirectory(m_dlls_path_cookie);
+            m_dlls_path_cookie = nullptr;
         }
     }
 } // namespace RC

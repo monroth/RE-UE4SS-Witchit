@@ -7,7 +7,13 @@ option(UE4SS_${TARGET}_BUILD_SHARED "Build as a shared lib" OFF)
 
 set(${TARGET}_Sources
         "${CMAKE_CURRENT_SOURCE_DIR}/src/LuaMadeSimple.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/HostUserdataObserver.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/HostOwnedUserdataHooks.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/HostExecutionHooks.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/HostTablePlan.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/HostExecutionFrame.c"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/LuaObject.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/HostFunctionFrame.c"
         )
 
 string(REGEX REPLACE "(.)([A-Z])" "\\1_\\2" MODULE_NAME ${TARGET})

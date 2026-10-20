@@ -44,7 +44,9 @@ target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 target_link_options(${TARGET} PRIVATE ${PRIVATE_LINK_OPTIONS})
 
-target_link_libraries(${TARGET} PUBLIC DynamicOutput)
+target_link_libraries(${TARGET} PUBLIC DynamicOutput Unreal)
+target_compile_definitions(${TARGET} PRIVATE
+    $<$<NOT:$<BOOL:${UE4SS_Unreal_BUILD_SHARED}>>:RC_UNREAL_BUILD_STATIC>)
 
 # Make headers visible in the IDE
 # Uses make_headers_visible() from cmake/modules/IDEVisibility.cmake

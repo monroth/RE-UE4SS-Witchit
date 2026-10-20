@@ -14,6 +14,7 @@
 #include <LuaType/LuaUFunction.hpp>
 #include <LuaType/LuaUInterface.hpp>
 #include <LuaType/LuaUObject.hpp>
+#include <LuaHost/ObjectLifetime.hpp>
 #include <LuaType/LuaUScriptStruct.hpp>
 #include <LuaType/LuaUStruct.hpp>
 #include <LuaType/LuaUWorld.hpp>
@@ -40,34 +41,30 @@
 
 namespace RC::LuaType
 {
-    std::unordered_set<size_t> s_lua_unreal_objects{};
-    std::mutex s_lua_unreal_objects_map_mutex{};
+    static LuaHost::ObjectLifetime s_lua_unreal_objects;
 
+    auto clear_global_unreal_objects_map() -> void {s_lua_unreal_objects.clear();}
+
+    auto observe_object_lifetime(Unreal::UObject* object) -> std::uint64_t
+    {
+        if(object==LuaMadeSimple::Type::special_invalid_ptr())return 0;
+        return s_lua_unreal_objects.observe(object);
+    }
+    auto object_lifetime_current(Unreal::UObject* object,std::uint64_t stamp) -> bool
+    {
+        return s_lua_unreal_objects.current(object,stamp);
+    }
     auto add_to_global_unreal_objects_map(Unreal::UObject* object) -> void
     {
-        if (object)
-        {
-            std::lock_guard lock{s_lua_unreal_objects_map_mutex};
-            s_lua_unreal_objects.emplace(object->HashObject());
-        }
+        (void)observe_object_lifetime(object);
     }
-
     auto remove_from_global_unreal_objects_map(const Unreal::UObject* object) -> void
     {
-        if (object)
-        {
-            std::lock_guard lock{s_lua_unreal_objects_map_mutex};
-            if (const auto it = s_lua_unreal_objects.find(object->HashObject()); it != s_lua_unreal_objects.end())
-            {
-                s_lua_unreal_objects.erase(it);
-            }
-        }
+        s_lua_unreal_objects.erase(object);
     }
-
     auto is_object_in_global_unreal_object_map(Unreal::UObject* object) -> bool
     {
-        std::lock_guard lock{s_lua_unreal_objects_map_mutex};
-        return object && s_lua_unreal_objects.contains(object->HashObject());
+        return s_lua_unreal_objects.contains(object);
     }
 
     static auto is_uobject_userdata(const LuaMadeSimple::Lua& lua, int32_t index) -> bool
@@ -134,6 +131,8 @@ namespace RC::LuaType
             lua.throw_error("[UFunction::call_ufunction_from_lua] Tried calling function without both UFunction and calling context");
         }
 
+        const auto context_lifetime=observe_object_lifetime(calling_context);
+        const auto function_lifetime=observe_object_lifetime(func);
         uint8_t num_ufunc_params = func->GetNumParms();
         uint16_t return_value_offset = func->GetReturnValueOffset();
 
@@ -142,34 +141,7 @@ namespace RC::LuaType
         Unreal::FName return_value_property_type{0u, 0u};
         int32_t return_value_property_offset_internal{};
 
-#ifndef _WIN32
-        // _ALLOCA_S_THRESHOLD only exists on Windows as far as I know, so let's define it the same on other systems.
-        static constexpr size_t _ALLOCA_S_THRESHOLD = 1024;
-#endif
-        const auto params_size = func->GetParmsSize();
-        const  bool requires_heap_alloc = params_size > _ALLOCA_S_THRESHOLD;
-        uint8_t* dynamic_unreal_function_data{};
-        if (requires_heap_alloc)
-        {
-            dynamic_unreal_function_data = static_cast<uint8_t*>(malloc(params_size));
-        }
-        else
-        {
-            dynamic_unreal_function_data = static_cast<uint8_t*>(alloca(params_size));
-        }
-        Unreal::FMemory::Memzero(dynamic_unreal_function_data, params_size);
-        struct DeferFree
-        {
-            uint8_t* data{};
-            bool requires_free{};
-            ~DeferFree()
-            {
-                if (data && requires_free)
-                {
-                    free(data);
-                }
-            }
-        } defer_free{dynamic_unreal_function_data, requires_heap_alloc};
+        DynamicUnrealFunctionData dynamic_unreal_function_data{};
         DynamicUnrealFunctionOutParameters dynamic_unreal_function_out_parameters{};
         bool has_out_params{false};
 
@@ -240,15 +212,14 @@ namespace RC::LuaType
                                     "Tried storing reference to a Lua table for an 'Out' parameter when calling a UFunction but no table was on the stack");
                         }
 
-                        // Duplicate the 'Out' table to the top of the stack for luaL_ref
+                        // Duplicate the Lua function to the top of the stack for luaL_ref
                         lua_pushvalue(lua.get_lua_state(), 1);
 
-                        // Take a reference to the 'Out' table (it also pops it of the stack); released after the call
+                        // Take a reference to the Lua function (it also pops it of the stack)
                         dynamic_unreal_function_out_parameters.add({.property = param_next, .lua_ref = lua.registry().make_ref()});
 
                         if (!param_next->IsA<Unreal::FStructProperty>() && !param_next->IsA<Unreal::FArrayProperty>())
                         {
-                            lua.discard_value();
                             continue;
                         }
                     }
@@ -257,11 +228,11 @@ namespace RC::LuaType
 
                     if (StaticState::m_property_value_pushers.contains(name_comparison_index))
                     {
-                        void* data = &dynamic_unreal_function_data[offset_internal];
+                        void* data = &dynamic_unreal_function_data.data[offset_internal];
 
                         const PusherParams pusher_params{.operation = Operation::Set,
                                                          .lua = lua,
-                                                         .base = static_cast<Unreal::UObject*>(static_cast<void*>(dynamic_unreal_function_data)),
+                                                         .base = static_cast<Unreal::UObject*>(static_cast<void*>(dynamic_unreal_function_data.data)),
                                                          .data = data,
                                                          .property = param_next};
                         StaticState::m_property_value_pushers[name_comparison_index](pusher_params);
@@ -279,10 +250,11 @@ namespace RC::LuaType
             };
         }
 
-        // It's assumed that everything is safe here
-        // Every part of the system is designed to throw when stuff goes wrong
-        // This code should never be executed in those cases
-        calling_context->ProcessEvent(func, dynamic_unreal_function_data);
+        // Argument conversion may enter Lua. Recheck the actual host Object
+        // lifetimes before dispatch; no caller-issued receipt or world gate.
+        if(!object_lifetime_current(calling_context,context_lifetime) || !object_lifetime_current(func,function_lifetime))
+            lua.throw_error("Native call target expired during argument conversion");
+        calling_context->ProcessEvent(func, dynamic_unreal_function_data.data);
 
         // If there are any 'Out' params, update the table that they correspond to
         if (has_out_params)
@@ -296,9 +268,6 @@ namespace RC::LuaType
 
                 // Use the stored registry index to put the original Lua table for the 'Out' param back on the stack
                 lua.registry().get_table_ref(lua_table_ref);
-                // The reference was only needed to get the table back here; release it so each call doesn't leave
-                // a registry entry behind that keeps the table (and everything stored in it) alive forever
-                luaL_unref(lua.get_lua_state(), LUA_REGISTRYINDEX, lua_table_ref);
                 auto lua_table = lua.get_table();
 
                 auto reuse_same_table = param->IsA<Unreal::FArrayProperty>() || param->IsA<Unreal::FStructProperty>() || param->IsA<Unreal::FSetProperty>();
@@ -312,12 +281,12 @@ namespace RC::LuaType
 
                 if (StaticState::m_property_value_pushers.contains(name_comparison_index))
                 {
-                    uint8_t* data = &dynamic_unreal_function_data[param->GetOffset_Internal()];
+                    uint8_t* data = &dynamic_unreal_function_data.data[param->GetOffset_Internal()];
 
                     const PusherParams pusher_params{
                             .operation = Operation::GetNonTrivialLocal,
                             .lua = lua,
-                            .base = static_cast<Unreal::UObject*>(static_cast<void*>(dynamic_unreal_function_data)),
+                            .base = static_cast<Unreal::UObject*>(static_cast<void*>(dynamic_unreal_function_data.data)),
                             .data = data,
                             .property = param,
                             .create_new_if_get_non_trivial_local = !reuse_same_table,
@@ -344,7 +313,7 @@ namespace RC::LuaType
 
             if (StaticState::m_property_value_pushers.contains(name_comparison_index))
             {
-                uint8_t* data = &dynamic_unreal_function_data[return_value_property_offset_internal];
+                uint8_t* data = &dynamic_unreal_function_data.data[return_value_property_offset_internal];
 
                 const PusherParams pusher_params{.operation = Operation::GetNonTrivialLocal,
                                                  .lua = lua,

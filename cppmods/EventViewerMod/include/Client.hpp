@@ -51,12 +51,8 @@ namespace RC::EventViewerMod
         auto render_perf_opts() -> void;
         auto render_view() -> void;
 
-        static auto combo_with_flags(const char* label,
-                                     int* current_item,
-                                     const char* const items[],
-                                     int items_count,
-                                     ImGuiComboFlags_ flags = ImGuiComboFlags_None,
-                                     const std::vector<int>& = {}) -> bool;
+        static auto combo_with_flags(const char* label, int* current_item, const char* const items[], int items_count, ImGuiComboFlags_ flags = ImGuiComboFlags_None)
+                -> bool;
 
         auto save_state() -> void;
         auto load_state() -> void;

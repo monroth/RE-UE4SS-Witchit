@@ -3,6 +3,8 @@
 #include <atomic>
 #include <functional>
 #include <mutex>
+#include <optional>
+#include <LuaHost/ModControlStore.hpp>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -43,6 +45,7 @@
 
 namespace RC
 {
+    namespace GUI { class LuaDebugger; }
     namespace Unreal
     {
         class UObject;
@@ -86,6 +89,8 @@ namespace RC
     {
       public:
         friend class CppUserModBase; // m_input_handler
+        friend class RC::GUI::DebuggingGUI;
+        friend class GUI::LuaDebugger;
 
       public:
         constexpr static CharType m_settings_file_name[] = STR("UE4SS-settings.ini");
@@ -155,14 +160,29 @@ namespace RC
         uint64_t m_hook_trampoline_load_library_ex_w;
 
       public:
-        std::vector<std::unique_ptr<Mod>> m_mods;
+        // Borrowable host controls. All Native work and final destruction are outside its mutex.
+        LuaHost::ModControlStore<Mod, ModId> m_mod_controls;
+        struct ModControlInfo {
+            ModId id{};
+            std::string name;
+            std::filesystem::path path;
+            bool lua{}, started{};
+            LuaHost::VmHandle vm{};
+            lua_State* root{};
+            lua_State* main{};
+            lua_State* hook{};
+            lua_State* async{};
+            bool has_state(lua_State* state) const { return state && (root==state || main==state || hook==state || async==state); }
+        };
+        mutable std::mutex m_mod_info_mutex;
+        std::vector<ModControlInfo> m_mod_info;
 
         RecognizableStruct m_shared_functions{};
 
         static inline UE4SSProgram* s_program{};
 
         bool m_has_game_specific_config{};
-        bool m_processing_events{};
+        std::atomic_bool m_processing_events{};
         bool m_pause_events_processing{};
         std::atomic_bool m_mods_are_being_touched{};
         bool m_custom_member_variable_layout_loaded{};
@@ -182,6 +202,10 @@ namespace RC
 
       public:
         UE4SSProgram(const std::filesystem::path& ModuleFilePath, std::initializer_list<BinaryOptions> options);
+#ifdef UE4SS_LUA_LIFECYCLE_GATE
+        struct OfflineLuaGate {};
+        explicit UE4SSProgram(OfflineLuaGate, const std::filesystem::path& mods, const std::filesystem::path& executable = {});
+#endif
         ~UE4SSProgram();
         UE4SSProgram(const UE4SSProgram&) = delete;
         UE4SSProgram(UE4SSProgram&&) = delete;
@@ -213,7 +237,9 @@ namespace RC
         auto start_cpp_mods(IsInitialStartup = IsInitialStartup::No) -> void;
         auto setup_mods() -> void;
         auto start_lua_mods() -> void;
-        auto uninstall_mods() -> void;
+        auto uninstall_mods() -> bool;
+        auto service_lua_host_retirements() -> void;
+        auto queue_host_event(EventCallable) -> void;
         auto fire_unreal_init_for_cpp_mods() -> void;
         auto fire_ui_init_for_cpp_mods() -> void;
         auto fire_program_start_for_cpp_mods() -> void;
@@ -223,26 +249,30 @@ namespace RC
       public:
         auto init() -> void;
         auto is_program_started() -> bool;
+        auto get_mods_snapshot() const -> std::vector<std::shared_ptr<Mod>>;
+        auto borrow_mod_by_id(ModId mod_id) const -> std::shared_ptr<Mod>;
+        auto borrow_mod_by_name(StringViewType, IsInstalled = IsInstalled::No, IsStarted = IsStarted::No, const std::function<bool(Mod*)>& = {}) const -> std::shared_ptr<Mod>;
+        static auto borrow_lua_mod_by_name(StringViewType, IsInstalled = IsInstalled::No, IsStarted = IsStarted::No) -> std::shared_ptr<LuaMod>;
+        static auto borrow_lua_mod_by_name(std::string_view, IsInstalled = IsInstalled::No, IsStarted = IsStarted::No) -> std::shared_ptr<LuaMod>;
+        static auto borrow_lua_mod_by_lua_state(lua_State*, IsInstalled = IsInstalled::No, IsStarted = IsStarted::No) -> std::shared_ptr<LuaMod>;
+        auto mod_control_snapshot() const -> std::vector<ModControlInfo>;
+        auto capture_lua_control(lua_State*) const -> std::optional<ModControlInfo>;
+        auto publish_mod_control_snapshot() -> void;
+        auto queue_lua_control_event(ModControlInfo, lua_State*, std::function<void(lua_State*)>) -> void;
+        auto drain_mod_control_retirements() -> void;
+        // Legacy borrowed pointers do not extend lifetime beyond the current host entry.
         auto find_mod_by_id(ModId mod_id) -> Mod*;
         auto find_lua_mod_by_id(ModId mod_id) -> LuaMod*;
         auto queue_reinstall_mods() -> void;
         auto queue_reinstall_mod(LuaMod* mod) -> void;
-        auto queue_reinstall_mod(CppMod* mod) -> void;
         auto queue_reinstall_mod(ModId mod_id) -> void;
         auto queue_uninstall_mod(LuaMod* mod) -> void;
-        auto queue_uninstall_mod(CppMod* mod) -> void;
         auto queue_uninstall_mod(ModId mod_id) -> void;
         auto queue_reinstall_mod_by_name(const std::string& mod_name) -> void;
         auto queue_reinstall_mod_by_name(std::string_view mod_name) -> void;
-        auto queue_reinstall_lua_mod_by_name(std::string_view mod_name) -> void;
-        auto queue_reinstall_cpp_mod_by_name(std::string_view mod_name) -> void;
         auto queue_uninstall_mod_by_name(const std::string& mod_name) -> void;
         auto queue_uninstall_mod_by_name(std::string_view mod_name) -> void;
-        auto queue_uninstall_lua_mod_by_name(std::string_view mod_name) -> void;
-        auto queue_uninstall_cpp_mod_by_name(std::string_view mod_name) -> void;
         auto queue_start_lua_mod_by_path(const std::filesystem::path& mod_path) -> void;
-        auto queue_start_cpp_mod_by_path(const std::filesystem::path& mod_path) -> void;
-        auto queue_start_cpp_mod(CppMod* mod) -> void;
         auto get_object_dumper_output_directory() -> const File::StringType;
         RC_UE4SS_API auto get_module_directory() -> File::StringType;
         RC_UE4SS_API auto get_game_executable_directory() -> File::StringType;
@@ -315,6 +345,10 @@ namespace RC
         auto unregister_keydown_events_for_lua_mod(LuaMod* mod, AllMods = AllMods::No) -> void;
 
       private:
+        // CppUserModBase and this host export preserve the actual first caller
+        // instruction through forwarding; no public owner/root override.
+        auto register_keydown_event_from_cpp_mod(Input::Key, const Input::Handler::ModifierKeyArray*,
+            const Input::EventCallbackCallable&, uint8_t, void*, const void* origin) -> bool;
         static auto install_cpp_mods() -> void;
         static auto install_lua_mods() -> void;
 

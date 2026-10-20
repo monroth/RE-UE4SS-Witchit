@@ -2,14 +2,26 @@
 
 #include <format>
 #include <functional>
+#include <memory>
 #include <optional>
 
 #include <LuaMadeSimple/Common.hpp>
+#include <LuaMadeSimple/HostUserdataObserver.hpp>
+#include <LuaMadeSimple/HostOwnedUserdataHooks.hpp>
 #include <lua.hpp>
 #include <fmt/core.h>
 
+namespace RC::LuaHost { struct LuaObjectTypeAccess; }
+
 namespace RC::LuaMadeSimple
 {
+    class Lua;
+    // Host-only pure registration capture; no Lua access while active.
+    auto host_table_plan_active(const Lua&) noexcept -> bool;
+    auto record_host_table_pair(const Lua&, std::string_view, int (*)(const Lua&)) -> void;
+    auto record_host_table_pair(const Lua&, std::string_view, int (*)(lua_State*)) -> void;
+    auto record_host_table_pair(const Lua&, std::string_view, bool) -> void;
+
     // To be used in the future to decide whether it's safe to perform any Lua actions
     enum class GlobalState
     {
@@ -25,6 +37,7 @@ namespace RC::LuaMadeSimple
     // Internal functions
     // All Lua <-> C++ calls go through these two C++ functions
     auto RC_LMS_API process_lua_function(lua_State* lua_state) -> int;
+    auto RC_LMS_API cached_root_lua_state(lua_State* actual_sdk_stack) noexcept -> lua_State*;
 
     /**
      * @tparam StackIndex Valid values are -1 for table key and -2 for table value
@@ -79,6 +92,7 @@ namespace RC::LuaMadeSimple
      */
     class Lua
     {
+        friend struct RC::LuaHost::LuaObjectTypeAccess;
         friend RC_LMS_API auto process_lua_function(lua_State* lua_state) -> int;
 
       private:
@@ -224,6 +238,7 @@ namespace RC::LuaMadeSimple
              * @param function C++ function pointer (can be lambda)
              */
             auto add_function_value_internal(LuaFunction function) const -> void;
+            auto add_raw_function_value_internal(LuaFunctionInternal function) const -> void;
             auto push_field_name_and_value(std::string_view field_name) -> int32_t;
 
           public:
@@ -240,15 +255,15 @@ namespace RC::LuaMadeSimple
             {
                 if constexpr (std::is_same_v<KeyType, const char*> || std::is_same_v<KeyType, char*>)
                 {
-                    lua_pushstring(get_lua_instance().get_lua_state(), key);
+                    lua_pushstring(get_lua_instance().checked_lua_state(), key);
                 }
                 else if constexpr (std::is_same_v<KeyType, int> || std::is_same_v<KeyType, size_t>)
                 {
-                    lua_pushinteger(get_lua_instance().get_lua_state(), key);
+                    lua_pushinteger(get_lua_instance().checked_lua_state(), key);
                 }
                 else if constexpr (std::is_same_v<KeyType, unsigned int>)
                 {
-                    lua_pushinteger(get_lua_instance().get_lua_state(), static_cast<int>(key));
+                    lua_pushinteger(get_lua_instance().checked_lua_state(), static_cast<int>(key));
                 }
                 else
                 {
@@ -266,27 +281,27 @@ namespace RC::LuaMadeSimple
             {
                 if constexpr (std::is_same_v<ValueType, const char*> || std::is_same_v<ValueType, char*>)
                 {
-                    lua_pushstring(get_lua_instance().get_lua_state(), value);
+                    lua_pushstring(get_lua_instance().checked_lua_state(), value);
                 }
                 else if constexpr (std::is_same_v<ValueType, bool>)
                 {
-                    lua_pushboolean(get_lua_instance().get_lua_state(), value);
+                    lua_pushboolean(get_lua_instance().checked_lua_state(), value);
                 }
                 else if constexpr (std::is_same_v<ValueType, int> || std::is_same_v<ValueType, long long>)
                 {
-                    lua_pushinteger(get_lua_instance().get_lua_state(), value);
+                    lua_pushinteger(get_lua_instance().checked_lua_state(), value);
                 }
                 else if constexpr (std::is_same_v<ValueType, unsigned int>)
                 {
-                    lua_pushinteger(get_lua_instance().get_lua_state(), static_cast<int>(value));
+                    lua_pushinteger(get_lua_instance().checked_lua_state(), static_cast<int>(value));
                 }
                 else if constexpr (std::is_same_v<ValueType, float> || std::is_same_v<ValueType, double>)
                 {
-                    lua_pushnumber(get_lua_instance().get_lua_state(), value);
+                    lua_pushnumber(get_lua_instance().checked_lua_state(), value);
                 }
                 else if constexpr (std::is_convertible_v<ValueType, LuaFunctionInternal>)
                 {
-                    lua_pushcfunction(get_lua_instance().get_lua_state(), value);
+                    add_raw_function_value_internal(static_cast<LuaFunctionInternal>(value));
                 }
                 else if constexpr (std::is_convertible_v<ValueType, LuaFunction>)
                 {
@@ -314,13 +329,29 @@ namespace RC::LuaMadeSimple
             template <typename KeyType, typename ValueType>
             auto add_pair(KeyType key, ValueType value) const -> void
             {
+                if (host_table_plan_active(get_lua_instance()))
+                {
+                    if constexpr (std::is_convertible_v<KeyType, std::string_view> &&
+                                  (std::is_convertible_v<ValueType, LuaFunction> ||
+                                   std::is_convertible_v<ValueType, LuaFunctionInternal> || std::is_same_v<ValueType, bool>))
+                    {
+                        if constexpr (std::is_same_v<ValueType, bool>)
+                            record_host_table_pair(get_lua_instance(), std::string_view{key}, value);
+                        else if constexpr (std::is_convertible_v<ValueType, LuaFunction>)
+                            record_host_table_pair(get_lua_instance(), std::string_view{key}, static_cast<LuaFunction>(value));
+                        else
+                            record_host_table_pair(get_lua_instance(), std::string_view{key}, static_cast<LuaFunctionInternal>(value));
+                    }
+                    else throw std::runtime_error("Unsupported host SDK registration plan value");
+                    return;
+                }
                 // Key
                 add_key(key);
 
                 // Value
                 add_value(value);
 
-                lua_rawset(get_lua_instance().get_lua_state(), -3);
+                lua_rawset(get_lua_instance().checked_lua_state(), -3);
             }
 
             /**
@@ -391,7 +422,7 @@ namespace RC::LuaMadeSimple
                     {
                         get_lua_instance().throw_error(fmt::format("[get_userdata_field] Attempted to get field: '{}' but the type was '{}'",
                                                                    field_name,
-                                                                   lua_typename(get_lua_instance().get_lua_state(), pushed_type)));
+                                                                   lua_typename(get_lua_instance().checked_lua_state(), pushed_type)));
                     }
                 }
 
@@ -513,6 +544,11 @@ namespace RC::LuaMadeSimple
         RC_LMS_API auto register_function(const std::string& name, const LuaFunction&) const -> void;
 
         RC_LMS_API auto get_lua_state() const -> lua_State*;
+        // SDK primitives require a live cached epoch and inherited real VM scope.
+        RC_LMS_API auto checked_lua_state() const -> lua_State*;
+    // Cached host VM identity: no Lua call, gate acquisition, or live-state
+    // dereference. Used to detach callback containers before a root closes.
+    RC_LMS_API auto get_root_lua_state() const -> lua_State*;
         RC_LMS_API auto get_stack_size() const -> int32_t;
         RC_LMS_API auto get_type_string() const -> std::string_view;
 
@@ -580,19 +616,27 @@ namespace RC::LuaMadeSimple
         RC_LMS_API auto construct_metamethods_object(const OptionalMetaMethods&, std::optional<std::string_view> metatable_name = std::nullopt) const -> void;
 
       public:
+        template <typename ObjectType>
+        static auto automatic_userdata_finalizer() noexcept -> LuaFunctionInternal
+        {
+            return [](lua_State* lua_state) -> int {
+                auto* userdata = static_cast<ObjectType*>(lua_touserdata(lua_state, 1));
+                notify_host_userdata_destroying(lua_state, userdata, host_userdata_type<ObjectType>());
+                userdata->~ObjectType();
+                return 0;
+            };
+        }
+
         // Create a new metatable and put references to member functions table in it
         // A metatable is automatically attached with a __gc metamethod that calls the ObjectType destructor
         // More metamethods can be supplied via the 'metamethods' parameter (see the 'MetaMethods' struct)
         template <typename ObjectType>
         auto new_metatable(std::optional<std::string_view> metatable_name = std::nullopt, OptionalMetaMethods metamethods = std::nullopt) const -> void
         {
-            auto create_auto_gc_metamethod = [](Table& metatable) {
-                metatable.add_pair("__gc", [](lua_State* lua_state) -> int {
-                    auto* userdata = static_cast<ObjectType*>(lua_touserdata(lua_state, 1));
-                    userdata->~ObjectType();
-
-                    return 0;
-                });
+            auto create_auto_gc_metamethod = [this](Table& metatable) {
+                const LuaFunctionInternal finalizer = automatic_userdata_finalizer<ObjectType>();
+                notify_host_userdata_finalizer(get_lua_state(), host_userdata_type<ObjectType>(), finalizer);
+                metatable.add_pair("__gc", publish_host_owned_userdata_finalizer(get_lua_state(),host_userdata_type<ObjectType>(),finalizer));
             };
 
             bool custom_gc_method{};
@@ -625,8 +669,8 @@ namespace RC::LuaMadeSimple
             }
             if (is_table(-2)) // if called from construct_metamethods_object this will be false
             {
-                lua_rotate(get_lua_state(), -2, 1);
-                lua_rawseti(get_lua_state(), -2, 1);
+                lua_rotate(checked_lua_state(), -2, 1);
+                lua_rawseti(checked_lua_state(), -2, 1);
             }
         }
 
@@ -638,16 +682,35 @@ namespace RC::LuaMadeSimple
                                    OptionalMetaMethods metamethods = std::nullopt,
                                    bool is_metamethod_container = false) const -> void
         {
-            auto* userdata = static_cast<ObjectType*>(lua_newuserdatauv(get_lua_state(), sizeof(ObjectType), 5));
+            struct Request { const Lua* lua; ObjectType* object; std::optional<std::string_view>* name;
+                OptionalMetaMethods* methods; bool container; } request{this,&object,&metatable_name,&metamethods,is_metamethod_container};
+            const auto construct=+[](void* opaque) { auto* r=static_cast<Request*>(opaque);
+                r->lua->transfer_stack_object_unchecked(std::move(*r->object),*r->name,*r->methods,r->container); };
+            const auto destroy=+[](void* storage) {static_cast<ObjectType*>(storage)->~ObjectType();};
+            bool handled{};
+            const auto status=execute_host_owned_userdata({this,host_userdata_type<ObjectType>(),sizeof(ObjectType),alignof(ObjectType),
+                &request,construct,destroy,false,metamethods && metamethods->gc.has_value(),automatic_userdata_finalizer<ObjectType>()},&handled);
+            if(status)throw std::runtime_error("Host refused Native userdata emission or destruction was incomplete");
+            if(!handled)transfer_stack_object_unchecked(std::move(object),metatable_name,metamethods,is_metamethod_container);
+        }
+
+        template <typename ObjectType>
+        auto transfer_stack_object_unchecked(ObjectType&& object,
+                                   std::optional<std::string_view> metatable_name = std::nullopt,
+                                   OptionalMetaMethods metamethods = std::nullopt,
+                                   bool is_metamethod_container = false) const -> void
+        {
+            bool host_owned{};
+            auto* userdata = static_cast<ObjectType*>(allocate_host_owned_userdata(get_lua_state(), host_userdata_type<ObjectType>(), sizeof(ObjectType), 5, &host_owned));
 
             // Set a user value that tells 'get_userdata()' that this userdata is a stack object owned by lua
             set_integer(UserdataInternalType::LuaOwnedStackObject);
-            lua_setiuservalue(get_lua_state(), -2, 2);
+            lua_setiuservalue(checked_lua_state(), -2, 2);
 
             // Attach metatable to useradata for reference
-            if (lua_rawgeti(get_lua_state(), -2, 1) == LUA_TTABLE)
+            if (lua_rawgeti(checked_lua_state(), -2, 1) == LUA_TTABLE)
             {
-                lua_setiuservalue(get_lua_state(), -2, 3);
+                lua_setiuservalue(checked_lua_state(), -2, 3);
             }
             else
             {
@@ -657,14 +720,14 @@ namespace RC::LuaMadeSimple
             if (!is_metamethod_container)
             {
                 // Set a user value that contains the metamethod handlers
-                if (lua_rawgeti(get_lua_state(), -2, 2) == LUA_TNIL)
+                if (lua_rawgeti(checked_lua_state(), -2, 2) == LUA_TNIL)
                 {
                     discard_value(-1);
                     construct_metamethods_object(metamethods, "MetaMethodContainer");
-                    lua_pushvalue(get_lua_state(), -1);
-                    lua_rawseti(get_lua_state(), -4, 2);
+                    lua_pushvalue(checked_lua_state(), -1);
+                    lua_rawseti(checked_lua_state(), -4, 2);
                 }
-                lua_setiuservalue(get_lua_state(), -2, 4);
+                lua_setiuservalue(checked_lua_state(), -2, 4);
             }
 
             // Set a user value that determines whether this is a polymorphic type.
@@ -677,14 +740,33 @@ namespace RC::LuaMadeSimple
             {
                 set_bool(false);
             }
-            lua_setiuservalue(get_lua_state(), -2, 5);
+            lua_setiuservalue(checked_lua_state(), -2, 5);
 
-            new (userdata) ObjectType(std::move(object));
-
-            // Remove dangling table
-            lua_remove(get_lua_state(), -2);
-            luaL_getmetatable(get_lua_state(), metatable_name.has_value() ? metatable_name.value().data() : "AutoGCMetatable");
-            lua_setmetatable(get_lua_state(), -2);
+            if(host_owned)
+            {
+                // Allocating metatable work completes before T construction.
+                // A strong HOST receipt keeps its storage alive on Lua error.
+                lua_remove(checked_lua_state(), -2);
+                luaL_getmetatable(checked_lua_state(), metatable_name.has_value() ? metatable_name.value().data() : "AutoGCMetatable");
+                lua_setmetatable(checked_lua_state(), -2);
+                arm_host_owned_userdata(get_lua_state(), userdata);
+                phase_host_owned_userdata(get_lua_state(), userdata, HostOwnedUserdataPhase::constructing);
+                try {new (userdata) ObjectType(std::move(object));}
+                catch (...) {phase_host_owned_userdata(get_lua_state(), userdata, HostOwnedUserdataPhase::constructor_threw);throw;}
+                phase_host_owned_userdata(get_lua_state(), userdata, HostOwnedUserdataPhase::constructed);
+            }
+            else
+            {
+                // Original HOST automatic helper identity and construction
+                // ordering remain available to exact UObject authority checks.
+                new (userdata) ObjectType(std::move(object));
+                lua_remove(checked_lua_state(), -2);
+                luaL_getmetatable(checked_lua_state(), metatable_name.has_value() ? metatable_name.value().data() : "AutoGCMetatable");
+                lua_setmetatable(checked_lua_state(), -2);
+            }
+            notify_host_userdata_completed(HostUserdataEmission{
+                get_lua_state(), userdata, host_userdata_type<ObjectType>(), sizeof(ObjectType), alignof(ObjectType), -1,
+                metatable_name.has_value() ? metatable_name.value().data() : "AutoGCMetatable"});
         }
 
         // Share a heap object (std::shared_ptr) with Lua via userdata
@@ -695,6 +777,15 @@ namespace RC::LuaMadeSimple
                                std::optional<std::string_view> metatable_name = std::nullopt,
                                OptionalMetaMethods metamethods = std::nullopt) const -> void
         {
+            bool handled{};
+            // shared_ptr's control-block/deleter creator cannot be authenticated
+            // from its layout. Native emission refuses before copying until a
+            // creator receipt seam exists; a helper DLL is not that receipt.
+            const auto construct=+[](void*) {};
+            const auto destroy=+[](void* storage) {static_cast<std::shared_ptr<ObjectType>*>(storage)->~shared_ptr<ObjectType>();};
+            const auto status=execute_host_owned_userdata({this,host_userdata_type<std::shared_ptr<ObjectType>>(),sizeof(std::shared_ptr<ObjectType>),
+                alignof(std::shared_ptr<ObjectType>),nullptr,construct,destroy,true,metamethods && metamethods->gc.has_value()},&handled);
+            if(status || handled)throw std::runtime_error("Native shared userdata needs an authenticated creator receipt");
             auto create_auto_gc_metamethod = [](Table& metatable) {
                 metatable.add_pair("__gc", [](lua_State* lua_state) -> int {
                     auto* userdata = static_cast<std::shared_ptr<ObjectType>*>(lua_touserdata(lua_state, 1));
@@ -732,18 +823,18 @@ namespace RC::LuaMadeSimple
                 create_auto_gc_metamethod(metatable);
             }
 
-            auto* userdata = static_cast<std::shared_ptr<ObjectType>*>(lua_newuserdatauv(get_lua_state(), sizeof(std::shared_ptr<ObjectType>), 2));
+            auto* userdata = static_cast<std::shared_ptr<ObjectType>*>(lua_newuserdatauv(checked_lua_state(), sizeof(std::shared_ptr<ObjectType>), 2));
 
             // Set a user value that tells 'get_userdata()' that this userdata is a shared heap object
             set_integer(UserdataInternalType::SharedHeapObject);
-            lua_setiuservalue(get_lua_state(), -2, 2);
+            lua_setiuservalue(checked_lua_state(), -2, 2);
 
             new (userdata) std::shared_ptr<ObjectType>(object);
 
             // Remove dangling table
-            lua_remove(get_lua_state(), -2);
-            luaL_getmetatable(get_lua_state(), metatable_name.has_value() ? metatable_name.value().data() : "AutoGCMetatable");
-            lua_setmetatable(get_lua_state(), -2);
+            lua_remove(checked_lua_state(), -2);
+            luaL_getmetatable(checked_lua_state(), metatable_name.has_value() ? metatable_name.value().data() : "AutoGCMetatable");
+            lua_setmetatable(checked_lua_state(), -2);
         }
 
         [[nodiscard]] RC_LMS_API auto is_userdata(int32_t force_index = 1) const -> bool;
@@ -751,32 +842,35 @@ namespace RC::LuaMadeSimple
         template <typename ObjectType>
         [[nodiscard]] auto get_userdata(int32_t force_index = 1, bool preserve_stack = false) const -> ObjectType&
         {
-            lua_getiuservalue(get_lua_state(), force_index, 2);
+            lua_getiuservalue(checked_lua_state(), force_index, 2);
             int64_t userdata_internal_type = get_integer(-1);
 
             if (userdata_internal_type == UserdataInternalType::LuaOwnedStackObject)
             {
                 // Stack object owned by Lua
-                auto& object = *static_cast<ObjectType*>(lua_touserdata(get_lua_state(), force_index));
+                auto* storage = lua_touserdata(checked_lua_state(), force_index);
+                if(!host_owned_userdata_readable(get_lua_state(),storage,host_userdata_type<ObjectType>()))
+                    throw std::runtime_error("Native userdata is unconstructed, destroyed, or has the wrong storage type");
+                auto& object = *static_cast<ObjectType*>(storage);
                 if (!preserve_stack)
                 {
-                    lua_remove(get_lua_state(), force_index);
+                    lua_remove(checked_lua_state(), force_index);
                 }
                 return object;
             }
             else if (userdata_internal_type == UserdataInternalType::SharedHeapObject)
             {
                 // Shared object (shared_ptr)
-                auto& object = **static_cast<std::shared_ptr<ObjectType>*>(lua_touserdata(get_lua_state(), force_index));
+                auto& object = **static_cast<std::shared_ptr<ObjectType>*>(lua_touserdata(checked_lua_state(), force_index));
                 if (!preserve_stack)
                 {
-                    lua_remove(get_lua_state(), force_index);
+                    lua_remove(checked_lua_state(), force_index);
                 }
                 return object;
             }
             else [[unlikely]]
             {
-                luaL_traceback(get_lua_state(),
+                luaL_traceback(checked_lua_state(),
                                get_lua_state(),
                                "[get_userdata] The user value 'userdata_internal_type' corresponding to this userdata was invalid\"",
                                0);

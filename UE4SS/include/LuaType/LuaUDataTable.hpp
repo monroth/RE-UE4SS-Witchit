@@ -1,6 +1,7 @@
 #pragma once
 #include <LuaType/LuaUObject.hpp>
 
+namespace RC::LuaHost { struct LuaObjectTypeAccess; }
 
 namespace RC::Unreal
 {
@@ -19,6 +20,7 @@ namespace RC::LuaType
 
     class UDataTable : public UObjectBase<Unreal::UDataTable, UDataTableName>
     {
+        friend struct RC::LuaHost::LuaObjectTypeAccess;
     public:
         explicit UDataTable(Unreal::UDataTable* object);
         UDataTable() = delete;

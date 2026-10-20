@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 
 #include <functional>
 #include <memory>
@@ -7,7 +8,6 @@
 #include <GUI/Console.hpp>
 #include <GUI/GUITab.hpp>
 #include <GUI/LiveView.hpp>
-#include <GUI/Mods.hpp>
 #include <Helpers/String.hpp>
 #include <imgui.h>
 
@@ -234,7 +234,6 @@ namespace RC::GUI
         ImFont* m_texteditor_font{};
         Console m_console{};
         LiveView m_live_view{};
-        ModsWidget m_mods_widget{};
         std::stop_token* m_thread_stop_token{};
         bool m_is_open{};
         bool m_exit_requested{};
@@ -244,7 +243,7 @@ namespace RC::GUI
         WindowSettings m_backend_window_settings;
 
       public:
-        bool m_event_thread_busy{};
+        std::atomic_bool m_event_thread_busy{};
 
       private:
         static std::vector<EndOfFrameCallback> s_end_of_frame_callbacks;

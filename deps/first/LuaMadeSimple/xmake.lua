@@ -10,6 +10,7 @@ target(projectName)
     add_headerfiles("include/**.hpp")
 
     add_files("src/**.cpp")
+    add_files("src/HostFunctionFrame.c", "src/HostExecutionFrame.c")
     
     add_deps("LuaRaw", { public = true })
     add_deps("Helpers")

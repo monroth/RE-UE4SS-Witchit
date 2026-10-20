@@ -134,6 +134,11 @@ auto dll_process_attached(HMODULE moduleHandle) -> void
 
 auto WIN_API_FUNCTION_NAME(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) -> BOOL
 {
+#ifdef UE4SS_LUA_LIFECYCLE_GATE
+    // Only the CMake-linked test executable suppresses game startup/scanning.
+    // No environment variable changes production loading behavior.
+    if (GetModuleHandleW(L"UE4SSLuaLifecycleGate.exe")) return TRUE;
+#endif
     switch (ul_reason_for_call)
     {
     case DLL_PROCESS_ATTACH:

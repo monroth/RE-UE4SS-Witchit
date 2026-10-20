@@ -1,5 +1,7 @@
 #pragma once
 
+#include <LuaHost/Lifecycle.hpp>
+
 #include <chrono>
 #include <mutex>
 #include <string>
@@ -34,6 +36,10 @@ namespace RC
       private:
         std::filesystem::path m_scripts_path;
         LuaMadeSimple::Lua& m_lua;
+        LuaHost::VmHandle m_host_vm{};
+        bool m_host_stop_notified{};
+        bool m_host_uninstall_running{};
+        bool m_host_vm_closed{};
 
       public:
         LuaMadeSimple::Lua* m_hook_lua = nullptr;
@@ -218,6 +224,9 @@ namespace RC
       public:
         auto start_mod() -> void override;
         auto uninstall() -> void override;
+        auto host_close_complete() const -> bool { return m_host_vm_closed || !m_host_vm.id; }
+        auto host_close_requested() const -> bool;
+        auto host_vm_handle() const -> LuaHost::VmHandle { return m_host_vm; }
 
         auto prepare_mod(const LuaMadeSimple::Lua& lua) -> void;
 
@@ -251,7 +260,7 @@ namespace RC
         // Called once when the program is starting, after mods are setup but before any mods have been started
         auto static on_program_start() -> void;
 
-        auto static global_uninstall() -> void;
+        auto static global_uninstall() -> bool;
 
         // Async update
         // Used when the main update function would block other mods from executing their scripts

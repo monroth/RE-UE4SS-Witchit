@@ -2,6 +2,8 @@
 
 #include <LuaType/LuaUStruct.hpp>
 
+namespace RC::LuaHost { struct LuaObjectTypeAccess; }
+
 namespace RC::Unreal
 {
     class UStruct;
@@ -38,6 +40,7 @@ namespace RC::LuaType
     };
     class UScriptStruct : public LocalObjectBase<ScriptStructWrapper, UScriptStructName>
     {
+        friend struct RC::LuaHost::LuaObjectTypeAccess;
       public:
         using Super = UStruct;
 

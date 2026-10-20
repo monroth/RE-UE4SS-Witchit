@@ -3,6 +3,8 @@
 #include <LuaMadeSimple/LuaObject.hpp>
 #include <LuaType/LuaUObject.hpp>
 
+namespace RC::LuaHost { struct LuaObjectTypeAccess; }
+
 namespace RC::Unreal
 {
     class UStruct;
@@ -14,11 +16,12 @@ namespace RC::LuaType
     {
         constexpr static const char* ToString()
         {
-            return "UClass";
+            return "UStruct";
         }
     };
     class UStruct : public UObjectBase<Unreal::UStruct, UStructName>
     {
+        friend struct RC::LuaHost::LuaObjectTypeAccess;
       public:
         using Super = UObject;
 

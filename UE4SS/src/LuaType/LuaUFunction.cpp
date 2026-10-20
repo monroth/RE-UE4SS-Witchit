@@ -26,7 +26,7 @@ namespace RC::LuaType
         return m_params;
     }
 
-    UFunction::UFunction(Unreal::UObject* base, Unreal::UFunction* function) : UObjectBase<Unreal::UFunction, UFunctionName>(function), m_base(base)
+    UFunction::UFunction(Unreal::UObject* base, Unreal::UFunction* function) : UObjectBase<Unreal::UFunction, UFunctionName>(function), m_base(base), base_lifetime_(observe_object_lifetime(base))
     {
     }
 

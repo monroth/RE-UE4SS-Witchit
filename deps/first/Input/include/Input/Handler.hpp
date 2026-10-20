@@ -13,6 +13,8 @@
 #include <Input/Common.hpp>
 #include <Input/KeyDef.hpp>
 
+namespace RC { class UE4SSProgram; }
+
 namespace RC::Input
 {
     using EventCallbackCallable = std::function<void()>;
@@ -23,14 +25,40 @@ namespace RC::Input
         ModifierKeys modifier_keys{};
     };
 
+    class Handler;
+    // Only this exported host implementation captures/copies Native managers.
+    // KeySet snapshots copy the stable host control block, never std::function.
+    class RC_INPUT_API OwnedEventCallback
+    {
+        struct Impl;
+        std::shared_ptr<Impl> m_impl;
+        friend class Handler;
+        static auto capture(const EventCallbackCallable&, const void* origin) -> OwnedEventCallback;
+    public:
+        OwnedEventCallback() = default;
+        OwnedEventCallback(const OwnedEventCallback&) noexcept = default;
+        OwnedEventCallback(OwnedEventCallback&&) noexcept = default;
+        auto operator=(const OwnedEventCallback&) noexcept -> OwnedEventCallback& = default;
+        auto operator=(OwnedEventCallback&&) noexcept -> OwnedEventCallback& = default;
+        OwnedEventCallback(const EventCallbackCallable&);
+        auto operator=(const EventCallbackCallable&) -> OwnedEventCallback&;
+        auto operator=(std::nullptr_t) noexcept -> OwnedEventCallback& { m_impl.reset(); return *this; }
+        explicit operator bool() const noexcept { return bool(m_impl); }
+        auto operator()() const -> void;
+    };
+
     struct KeyData
     {
         ModifierKeys required_modifier_keys{};
-        EventCallbackCallable callback{};
+        OwnedEventCallback callback{};
         uint8_t custom_data{};
         void* custom_data2{};
         bool requires_modifier_keys{};
         bool is_down{};
+    private:
+        friend class Handler;
+        std::uint64_t event_id{};
+        const Handler* event_id_owner{};
     };
 
     struct KeySet
@@ -52,6 +80,12 @@ namespace RC::Input
 
         std::shared_ptr<PlatformInputSource> m_platform_handler;
         std::mutex m_event_mutex;
+        std::uint64_t m_next_event_id{1};
+        friend class ::RC::UE4SSProgram;
+        // Only trusted forwarding code supplies the first export's origin.
+        auto register_keydown_event_from_host(Input::Key, const ModifierKeyArray*,
+            const EventCallbackCallable&, uint8_t, void*, const void* origin) -> bool;
+        auto get_events_safe_from_host(std::function<void(KeySet&)>, const void* origin) -> void;
 
       public:
         Handler() {};

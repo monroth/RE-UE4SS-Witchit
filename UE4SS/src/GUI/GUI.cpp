@@ -5,7 +5,7 @@
 #include <Profiler/Profiler.hpp>
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <ExceptionHandling.hpp>
-#include <GUI/Mods.hpp>
+#include <GUI/BPMods.hpp>
 #include <GUI/DX11.hpp>
 #include <GUI/Dumpers.hpp>
 #include <GUI/GLFW3_OpenGL3.hpp>
@@ -95,10 +95,10 @@ namespace RC::GUI
                     if (ImGui::Button(ICON_FA_ARCHIVE " Dump Objects & Properties"))
                     {
                         m_event_thread_busy = true;
-                        UE4SSProgram::get_program().queue_event([this]() {
+                        UE4SSProgram::get_program().queue_host_event([]() {
                             UE4SSProgram::dump_all_objects_and_properties(UE4SSProgram::get_program().get_object_dumper_output_directory() + STR("\\") +
                                                                           UE4SSProgram::m_object_dumper_file_name);
-                            m_event_thread_busy = false;
+                            UE4SSProgram::get_program().get_debugging_ui().m_event_thread_busy = false;
                         });
                     }
                     if (event_thread_busy)
@@ -114,9 +114,9 @@ namespace RC::GUI
                     if (ImGui::Button(ICON_FA_SYNC " Restart All Mods"))
                     {
                         m_event_thread_busy = true;
-                        UE4SSProgram::get_program().queue_event([this]() {
+                        UE4SSProgram::get_program().queue_host_event([]() {
                             UE4SSProgram::get_program().queue_reinstall_mods();
-                            m_event_thread_busy = false;
+                            UE4SSProgram::get_program().get_debugging_ui().m_event_thread_busy = false;
                         });
                     }
                     if (event_thread_busy)
@@ -173,14 +173,10 @@ namespace RC::GUI
                     ImGui::EndTabItem();
                 }
 
-                if (ImGui::BeginTabItem(ICON_FA_PUZZLE_PIECE " Mods"))
+                if (ImGui::BeginTabItem(ICON_FA_PUZZLE_PIECE " BP Mods"))
                 {
-                    m_mods_widget.render();
+                    BPMods::render();
                     ImGui::EndTabItem();
-                }
-                else
-                {
-                    m_mods_widget.cleanup();
                 }
 
                 if (ImGui::BeginTabItem(ICON_FA_BUG " Lua Debugger"))

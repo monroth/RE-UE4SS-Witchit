@@ -40,9 +40,9 @@ namespace RC
       protected:
         // Whether the mod can be installed
         // This is true by default and is only false if the state of the mod won't allow for a successful installation
-        bool m_installable{true};
-        bool m_installed{false};
-        mutable bool m_is_started{false};
+        std::atomic_bool m_installable{true};
+        std::atomic_bool m_installed{false};
+        mutable std::atomic_bool m_is_started{false};
 
       public:
         enum class IsTrueMod

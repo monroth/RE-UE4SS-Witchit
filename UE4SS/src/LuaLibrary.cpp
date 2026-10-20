@@ -5,7 +5,9 @@
 #include <Helpers/String.hpp>
 #include <LuaLibrary.hpp>
 #include <LuaMadeSimple/LuaMadeSimple.hpp>
+#include <LuaMadeSimple/HostExecutionHooks.hpp>
 #include <UE4SSProgram.hpp>
+#include <LuaHost/HostBindings.hpp>
 #include <Unreal/FOutputDevice.hpp>
 #include <Unreal/UnrealInitializer.hpp>
 
@@ -31,12 +33,7 @@ namespace RC::LuaLibrary
         lua_setglobal(lua.get_lua_state(), "OutputDeviceRef");
     }
 
-    enum class AutoNewLine
-    {
-        Yes,
-        No,
-    };
-    static auto print_impl(const LuaMadeSimple::Lua& lua, AutoNewLine auto_new_line)
+    auto global_print(const LuaMadeSimple::Lua& lua) -> int
     {
         auto* output_device = get_outputdevice_ref(lua);
 
@@ -103,11 +100,6 @@ namespace RC::LuaLibrary
             lua.discard_value(-1);
         }
 
-        if (auto_new_line == AutoNewLine::Yes)
-        {
-            formatted_string.append(STR("\n"));
-        }
-
         Output::send(formatted_string);
 
         if (output_device)
@@ -116,16 +108,6 @@ namespace RC::LuaLibrary
         }
 
         return 0;
-    }
-
-    auto global_print(const LuaMadeSimple::Lua& lua) -> int
-    {
-        return print_impl(lua, AutoNewLine::No);
-    }
-
-    auto global_println(const LuaMadeSimple::Lua& lua) -> int
-    {
-        return print_impl(lua, AutoNewLine::Yes);
     }
 
     auto deref_to_int32(const LuaMadeSimple::Lua& lua) -> int
@@ -209,11 +191,15 @@ namespace RC::LuaLibrary
 
     auto get_lua_state_by_mod_name(const char* mod_name) -> lua_State*
     {
-        auto* mod = UE4SSProgram::find_lua_mod_by_name(mod_name);
+        auto mod = UE4SSProgram::borrow_lua_mod_by_name(mod_name);
         if (!mod)
         {
             return nullptr;
         }
+        // This compatibility API exports a raw state; only synchronous admission
+        // is owned here. The external caller still needs the versioned lease API.
+        auto pin=LuaHost::HostBindings::instance().lifecycle().enter_vm_execution(mod->host_vm_handle());
+        if (pin.status!=LuaHost::Status::ok) return nullptr;
         return mod->lua().get_lua_state();
     };
 
@@ -221,7 +207,7 @@ namespace RC::LuaLibrary
     {
         std::string_view output_buffer_view{output_buffer};
 
-        auto* mod = UE4SSProgram::find_lua_mod_by_name(mod_name);
+        auto mod = UE4SSProgram::borrow_lua_mod_by_name(mod_name);
         if (!mod || !mod->is_installed() || !mod->is_started())
         {
             auto error_message = fmt::format("No mod by name '{}' found.", mod_name);
@@ -229,6 +215,9 @@ namespace RC::LuaLibrary
             return output_buffer;
         }
 
+        auto pin=LuaHost::HostBindings::instance().lifecycle().enter_vm_execution(mod->host_vm_handle());
+        if (pin.status!=LuaHost::Status::ok) return output_buffer;
+        LuaMadeSimple::LuaExecutionScope execution{mod->get_lua_state(), mod->get_lua_state()};
         try
         {
             if (int status = luaL_loadstring(mod->lua().get_lua_state(), script); status != LUA_OK)
@@ -271,7 +260,7 @@ namespace RC::LuaLibrary
             Output::send(STR("Setting variable '{}' in mod '{}' to {}\n"), variable_name_wide, mod_name_wide, new_value);
             //*/
 
-            auto mod = UE4SSProgram::find_lua_mod_by_name(mod_name, UE4SSProgram::IsInstalled::Yes, UE4SSProgram::IsStarted::Yes);
+            auto mod = UE4SSProgram::borrow_lua_mod_by_name(mod_name, UE4SSProgram::IsInstalled::Yes, UE4SSProgram::IsStarted::Yes);
             if (!mod)
             {
                 return_struct.status = ExportedFunctionStatus::MOD_IS_NULLPTR;
@@ -279,6 +268,9 @@ namespace RC::LuaLibrary
                 return;
             }
 
+            auto pin=LuaHost::HostBindings::instance().lifecycle().enter_vm_execution(mod->host_vm_handle());
+            if (pin.status!=LuaHost::Status::ok) { return_struct.status=ExportedFunctionStatus::MOD_IS_NULLPTR;return; }
+            LuaMadeSimple::LuaExecutionScope execution{mod->get_lua_state(), mod->get_lua_state()};
             const LuaMadeSimple::Lua& lua = mod->lua();
 
             auto type = lua_getglobal(lua.get_lua_state(), variable_name);
@@ -340,7 +332,7 @@ namespace RC::LuaLibrary
             }
             //*/
 
-            auto mod = UE4SSProgram::find_lua_mod_by_name(mod_name, UE4SSProgram::IsInstalled::Yes, UE4SSProgram::IsStarted::Yes);
+            auto mod = UE4SSProgram::borrow_lua_mod_by_name(mod_name, UE4SSProgram::IsInstalled::Yes, UE4SSProgram::IsStarted::Yes);
             if (!mod)
             {
                 return_struct.status = ExportedFunctionStatus::MOD_IS_NULLPTR;
@@ -348,6 +340,9 @@ namespace RC::LuaLibrary
                 return;
             }
 
+            auto pin=LuaHost::HostBindings::instance().lifecycle().enter_vm_execution(mod->host_vm_handle());
+            if (pin.status!=LuaHost::Status::ok) { return_struct.status=ExportedFunctionStatus::MOD_IS_NULLPTR;return; }
+            LuaMadeSimple::LuaExecutionScope execution{mod->get_lua_state(), mod->get_lua_state()};
             const LuaMadeSimple::Lua& lua = mod->lua();
             auto lua_table = lua.prepare_new_table();
 
@@ -434,7 +429,7 @@ namespace RC::LuaLibrary
             Output::send(STR("Calling script function '{}' in mod '{}'\n"), func_name_wide, mod_name_wide);
             //*/
 
-            auto mod = UE4SSProgram::find_lua_mod_by_name(mod_name, UE4SSProgram::IsInstalled::Yes, UE4SSProgram::IsStarted::Yes);
+            auto mod = UE4SSProgram::borrow_lua_mod_by_name(mod_name, UE4SSProgram::IsInstalled::Yes, UE4SSProgram::IsStarted::Yes);
             if (!mod)
             {
                 return_struct.status = ExportedFunctionStatus::MOD_IS_NULLPTR;
@@ -442,6 +437,9 @@ namespace RC::LuaLibrary
                 return;
             }
 
+            auto pin=LuaHost::HostBindings::instance().lifecycle().enter_vm_execution(mod->host_vm_handle());
+            if (pin.status!=LuaHost::Status::ok) { return_struct.status=ExportedFunctionStatus::MOD_IS_NULLPTR;return; }
+            LuaMadeSimple::LuaExecutionScope execution{mod->get_lua_state(), mod->get_lua_state()};
             const LuaMadeSimple::Lua& lua = mod->lua();
 
             try

@@ -797,7 +797,8 @@
 #define lua_unlock(L) LuaUnlock(L)
 #define luai_userstateopen(L) LuaLockInitial(L)
 #define luai_userstateclose(L) LuaLockFinal(L)
-#define luai_userstatethread(L,L1) LuaLockInitial(L1)
+#define luai_userstatethread(L,L1) do { LuaLockInitial(L1); LuaHostThreadBorn(L,L1); } while (0)
+#define luai_userstatefree(L,L1) LuaHostThreadFree(L,L1)
 
 
 

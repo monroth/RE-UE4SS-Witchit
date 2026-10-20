@@ -1,6 +1,17 @@
 #include <array>
 #include <climits>
 #include <cstring>
+#include <unordered_set>
+#include <limits>
+#include <Unreal/Hooks/Internal/CallbackOwnerBridge.hpp>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define RC_INPUT_ORIGIN _ReturnAddress()
+#elif defined(__GNUC__) || defined(__clang__)
+#define RC_INPUT_ORIGIN __builtin_extract_return_addr(__builtin_return_address(0))
+#else
+#define RC_INPUT_ORIGIN nullptr
+#endif
 
 #include <Input/Handler.hpp>
 #include <Input/PlatformInputSource.hpp>
@@ -8,6 +19,34 @@
 
 namespace RC::Input
 {
+    using CallbackSlot = Unreal::Hook::Internal::TCallbackSlot<EventCallbackCallable>;
+    struct OwnedEventCallback::Impl
+    {
+        std::shared_ptr<CallbackSlot> slot;
+        explicit Impl(std::shared_ptr<CallbackSlot> value) : slot(std::move(value)) {}
+    };
+    auto OwnedEventCallback::capture(const EventCallbackCallable& callback, const void* origin) -> OwnedEventCallback
+    {
+        OwnedEventCallback result;
+        if (!callback) return result;
+        auto slot = CallbackSlot::CreateCopy(callback, origin);
+        if (slot) result.m_impl = std::make_shared<Impl>(std::move(slot));
+        return result;
+    }
+    OwnedEventCallback::OwnedEventCallback(const EventCallbackCallable& callback)
+        : OwnedEventCallback(capture(callback, RC_INPUT_ORIGIN)) {}
+    auto OwnedEventCallback::operator=(const EventCallbackCallable& callback) -> OwnedEventCallback&
+    {
+        auto next = capture(callback, RC_INPUT_ORIGIN);
+        m_impl.swap(next.m_impl); // previous manager disposal happens outside Input locks
+        return *this;
+    }
+    auto OwnedEventCallback::operator()() const -> void
+    {
+        auto value = m_impl;
+        if (value) value->slot->Invoke();
+    }
+
     std::unordered_map<std::string, std::shared_ptr<PlatformInputSource>> Handler::m_input_sources_store;
 
     auto Handler::process_event() -> void
@@ -17,7 +56,7 @@ namespace RC::Input
             return;
         }
 
-        std::vector<EventCallbackCallable> callbacks_to_call{};
+        std::vector<OwnedEventCallback> callbacks_to_call{};
 
         auto events = m_platform_handler->process_event(this);
 
@@ -26,8 +65,9 @@ namespace RC::Input
             auto event_update_lock = std::lock_guard(m_event_mutex);
             for (auto& event : events)
             {
-                auto key_set_array = m_key_set.key_data[event.key];
-                for (auto& key_data : key_set_array)
+                const auto found = m_key_set.key_data.find(event.key);
+                if (found == m_key_set.key_data.end()) continue;
+                for (const auto& key_data : found->second)
                 {
                     if (key_data.required_modifier_keys == event.modifier_keys)
                     {
@@ -47,25 +87,46 @@ namespace RC::Input
 
     auto Handler::register_keydown_event(Input::Key key, EventCallbackCallable callback, uint8_t custom_data, void* custom_data2) -> void
     {
-        auto event_update_lock = std::lock_guard(m_event_mutex);
-        KeyData& key_data = m_key_set.key_data[key].emplace_back();
-        key_data.callback = callback;
-        key_data.custom_data = custom_data;
-        key_data.custom_data2 = custom_data2;
-        m_subscribed_keys[key] = true;
+        // Capture at this actual public export. Caller-owned by-value input is
+        // moved into an owned slot before entering the Input registry mutex.
+        auto slot = CallbackSlot::Create(std::move(callback), RC_INPUT_ORIGIN);
+        if (!slot || static_cast<std::size_t>(key) >= m_subscribed_keys.size()) return;
+        OwnedEventCallback owned;
+        owned.m_impl = std::make_shared<OwnedEventCallback::Impl>(std::move(slot));
+        KeyData entry;
+        entry.callback = std::move(owned); entry.custom_data = custom_data; entry.custom_data2 = custom_data2;
+        {
+            auto lock = std::lock_guard(m_event_mutex);
+            if (m_next_event_id == std::numeric_limits<std::uint64_t>::max()) return;
+            entry.event_id = m_next_event_id++; entry.event_id_owner = this;
+            m_key_set.key_data[key].emplace_back(std::move(entry));
+            m_subscribed_keys[key] = true;
+        }
     }
 
-    auto Handler::register_keydown_event(
-            Input::Key key, const ModifierKeyArray& modifier_keys, const EventCallbackCallable& callback, uint8_t custom_data, void* custom_data2) -> void
+    auto Handler::register_keydown_event(Input::Key key, const ModifierKeyArray& modifier_keys,
+            const EventCallbackCallable& callback, uint8_t custom_data, void* custom_data2) -> void
     {
-        auto event_update_lock = std::lock_guard(m_event_mutex);
-        KeyData& key_data = m_key_set.key_data[key].emplace_back();
-        key_data.callback = callback;
-        key_data.custom_data = custom_data;
-        key_data.custom_data2 = custom_data2;
-        key_data.requires_modifier_keys = true;
-        key_data.required_modifier_keys = modifier_keys;
-        m_subscribed_keys[key] = true;
+        register_keydown_event_from_host(key, &modifier_keys, callback, custom_data, custom_data2, RC_INPUT_ORIGIN);
+    }
+
+    auto Handler::register_keydown_event_from_host(Input::Key key, const ModifierKeyArray* modifiers,
+            const EventCallbackCallable& callback, uint8_t custom_data, void* custom_data2, const void* origin) -> bool
+    {
+        if (static_cast<std::size_t>(key) >= m_subscribed_keys.size()) return false;
+        KeyData entry;
+        entry.callback = OwnedEventCallback::capture(callback, origin);
+        if (!entry.callback) return false;
+        entry.custom_data = custom_data; entry.custom_data2 = custom_data2;
+        if (modifiers) { entry.requires_modifier_keys = true; entry.required_modifier_keys = *modifiers; }
+        {
+            auto lock = std::lock_guard(m_event_mutex);
+            if (m_next_event_id == std::numeric_limits<std::uint64_t>::max()) return false;
+            entry.event_id = m_next_event_id++; entry.event_id_owner = this;
+            m_key_set.key_data[key].emplace_back(std::move(entry));
+            m_subscribed_keys[key] = true;
+        }
+        return true;
     }
 
     auto Handler::is_keydown_event_registered(Input::Key key) -> bool
@@ -107,23 +168,65 @@ namespace RC::Input
 
     auto Handler::has_event_on_key(Input::Key key) -> bool
     {
-        return m_subscribed_keys[key];
+        auto lock = std::lock_guard(m_event_mutex);
+        return static_cast<std::size_t>(key) < m_subscribed_keys.size() && m_subscribed_keys[key];
     }
 
     auto Handler::get_events_safe(std::function<void(KeySet&)> callback) -> void
     {
-        auto event_update_lock = std::lock_guard(m_event_mutex);
-        callback(m_key_set);
+        get_events_safe_from_host(std::move(callback), RC_INPUT_ORIGIN);
+    }
+
+    auto Handler::get_events_safe_from_host(std::function<void(KeySet&)> callback, const void* origin) -> void
+    {
+        using VisitorSlot = Unreal::Hook::Internal::TCallbackSlot<std::function<void(KeySet&)>>;
+        auto visitor = VisitorSlot::Create(std::move(callback), origin);
+        if (!visitor) return;
+        KeySet next;
+        std::unordered_set<std::uint64_t> original_ids;
+        {
+            auto lock = std::lock_guard(m_event_mutex);
+            next = m_key_set; // copies only stable host callback control blocks
+            for (const auto& [key, entries] : next.key_data)
+                for (const auto& entry : entries) original_ids.insert(entry.event_id);
+        }
+        // Erase/edit, arbitrary visitor code, and Native manager disposal are
+        // all outside the Input mutex. Unknown custom_data2 remains caller-owned.
+        if (!visitor->Invoke(next)) return;
+        std::unordered_set<std::uint64_t> published_ids;
+        {
+            auto lock = std::lock_guard(m_event_mutex);
+            // Registrations added while the visitor ran remain intact. A later
+            // edit of the same original event wins in publication order.
+            for (const auto& [key, entries] : m_key_set.key_data)
+                for (const auto& entry : entries)
+                    if (!original_ids.contains(entry.event_id)) next.key_data[key].push_back(entry);
+            for (auto& [key, entries] : next.key_data)
+                for (auto& entry : entries) {
+                    if (entry.event_id_owner != this || !entry.event_id || !published_ids.insert(entry.event_id).second) {
+                        if (m_next_event_id == std::numeric_limits<std::uint64_t>::max()) return;
+                        entry.event_id = m_next_event_id++; entry.event_id_owner = this;
+                        published_ids.insert(entry.event_id);
+                    }
+                }
+            m_key_set.key_data.swap(next.key_data);
+            m_subscribed_keys.fill(false);
+            for (const auto& [key, entries] : m_key_set.key_data)
+                if (!entries.empty() && static_cast<std::size_t>(key) < m_subscribed_keys.size()) m_subscribed_keys[key] = true;
+        }
+        // next now owns displaced storage; last callback references drop here.
     }
 
     auto Handler::clear_subscribed_keys() -> void
     {
+        auto lock = std::lock_guard(m_event_mutex);
         m_subscribed_keys.fill(false);
     }
 
     auto Handler::clear_subscribed_key(Key k) -> void
     {
-        m_subscribed_keys[k] = false;
+        auto lock = std::lock_guard(m_event_mutex);
+        if (static_cast<std::size_t>(k) < m_subscribed_keys.size()) m_subscribed_keys[k] = false;
     }
 
     auto Handler::get_allow_input() -> bool

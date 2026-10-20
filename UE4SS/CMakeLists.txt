@@ -53,7 +53,8 @@ message("UE4SS Version: ${UE4SS_LIB_VERSION_MAJOR}.${UE4SS_LIB_VERSION_MINOR}.${
 
 # Find source files
 file(GLOB_RECURSE UE4SS_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/**.cpp")
-file(GLOB_RECURSE UE4SS_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/include/**.hpp")
+list(APPEND UE4SS_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/LuaHost/LuaValueFrame.c" "${CMAKE_CURRENT_SOURCE_DIR}/src/LuaHost/LuaEntryFrame.c" "${CMAKE_CURRENT_SOURCE_DIR}/src/LuaHost/LuaReferenceFrame.c" "${CMAKE_CURRENT_SOURCE_DIR}/src/LuaHost/LuaCallbackFrame.c" "${CMAKE_CURRENT_SOURCE_DIR}/src/LuaHost/LuaTokenFrame.c" "${CMAKE_CURRENT_SOURCE_DIR}/src/LuaHost/LuaObjectFrame.c" "${CMAKE_CURRENT_SOURCE_DIR}/src/LuaHost/LuaThreadFrame.c" "${CMAKE_CURRENT_SOURCE_DIR}/src/LuaHost/LuaNativeFrame.c" "${CMAKE_CURRENT_SOURCE_DIR}/src/LuaHost/LuaOwnedUserdataFrame.c")
+file(GLOB_RECURSE UE4SS_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/include/**.hpp" "${CMAKE_CURRENT_SOURCE_DIR}/include/**.h")
 
 # Create the main library
 add_library(UE4SS SHARED ${UE4SS_SOURCES})
@@ -170,3 +171,37 @@ set_target_properties(UE4SS PROPERTIES
 # Use the organize_targets function from IDEOrganization.cmake
 # The organize_special_targets function will also handle this target
 organize_targets("^UE4SS$" "RE-UE4SS")
+
+# A real linked-DLL lifecycle gate; engine operations alone are replaced.
+option(UE4SS_BUILD_LUA_LIFECYCLE_GATE "Build the no-engine LuaMod lifecycle gate" ON)
+option(UE4SS_LUA_LIFECYCLE_BASELINE "Negative control: omit the host ingress adapter" OFF)
+option(UE4SS_LUA_DISPATCH_BASELINE "Negative control: restore review-3 dispatch failures" OFF)
+option(UE4SS_LUA_REVIEW4_BASELINE "Negative control: restore review-4 dispatch failures" OFF)
+option(UE4SS_LUA_REVIEW5_BASELINE "Negative control: restore review-5 dispatcher failures" OFF)
+option(UE4SS_LUA_DIRECTORY_BASELINE "Negative control: raw directory __index without actual-stack ingress" OFF)
+option(UE4SS_LUA_REVIEW6_BASELINE "Negative control: accept ProcessEvent without an identity producer" OFF)
+if(WIN32 AND UE4SS_BUILD_LUA_LIFECYCLE_GATE)
+    target_compile_definitions(UE4SS PRIVATE UE4SS_LUA_LIFECYCLE_GATE)
+    if(UE4SS_LUA_LIFECYCLE_BASELINE)
+        set_source_files_properties("src/Mod/LuaMod.cpp" PROPERTIES COMPILE_DEFINITIONS UE4SS_LUA_LIFECYCLE_BASELINE)
+    endif()
+    if(UE4SS_LUA_DISPATCH_BASELINE)
+        set_property(SOURCE "src/Mod/LuaMod.cpp" APPEND PROPERTY COMPILE_DEFINITIONS UE4SS_LUA_DISPATCH_BASELINE)
+    endif()
+    if(UE4SS_LUA_REVIEW4_BASELINE)
+        set_property(SOURCE "src/Mod/LuaMod.cpp" APPEND PROPERTY COMPILE_DEFINITIONS UE4SS_LUA_REVIEW4_BASELINE)
+    endif()
+    if(UE4SS_LUA_REVIEW5_BASELINE)
+        set_property(SOURCE "src/Mod/LuaMod.cpp" APPEND PROPERTY COMPILE_DEFINITIONS UE4SS_LUA_REVIEW5_BASELINE)
+    endif()
+    if(UE4SS_LUA_DIRECTORY_BASELINE)
+        set_property(SOURCE "src/Mod/LuaMod.cpp" APPEND PROPERTY COMPILE_DEFINITIONS UE4SS_LUA_DIRECTORY_BASELINE)
+    endif()
+    if(UE4SS_LUA_REVIEW6_BASELINE)
+        set_property(SOURCE "src/Mod/LuaMod.cpp" APPEND PROPERTY COMPILE_DEFINITIONS UE4SS_LUA_REVIEW6_BASELINE)
+    endif()
+    add_executable(UE4SSLuaLifecycleGate "../tests/LuaHost/ModLifecycleGateMain.cpp" "../tests/LuaHost/SerialAllocationGate.cpp")
+    target_link_libraries(UE4SSLuaLifecycleGate PRIVATE UE4SS)
+    set_target_properties(UE4SSLuaLifecycleGate PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:UE4SS>")
+endif()

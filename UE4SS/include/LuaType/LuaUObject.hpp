@@ -5,6 +5,8 @@
 #include <format>
 #include <functional>
 #include <type_traits>
+#include <cstdint>
+#include <stdexcept>
 
 #include <Constructs/Generator.hpp>
 #include <DynamicOutput/DynamicOutput.hpp>
@@ -28,6 +30,7 @@ concept IsConvertableToLuaInteger = std::is_integral_v<SupposedIntegralType>;
 
 namespace RC::LuaType
 {
+    auto clear_global_unreal_objects_map() -> void;
     struct FLuaObjectDeleteListener : public Unreal::FUObjectDeleteListener
     {
         static FLuaObjectDeleteListener s_lua_object_delete_listener;
@@ -36,6 +39,7 @@ namespace RC::LuaType
 
         void OnUObjectArrayShutdown() override
         {
+            clear_global_unreal_objects_map();
             Unreal::UObjectArray::RemoveUObjectDeleteListener(this);
         }
     };
@@ -44,6 +48,10 @@ namespace RC::LuaType
 
     using Operation = LuaMadeSimple::Type::Operation;
 
+    RC_UE4SS_API auto observe_object_lifetime(Unreal::UObject*) -> std::uint64_t;
+    RC_UE4SS_API auto object_lifetime_current(Unreal::UObject*,std::uint64_t) -> bool;
+    auto remove_from_global_unreal_objects_map(const Unreal::UObject*) -> void;
+
     template <typename ObjectType, template <typename T> typename LuaObjectBase, typename ObjectName>
     class ObjectBase : public LuaObjectBase<ObjectType>
     {
@@ -51,13 +59,31 @@ namespace RC::LuaType
         using SelfType = ObjectBase<ObjectType, LuaObjectBase, ObjectName>;
         using Super = SelfType;
         using ClassName = ObjectName;
+        std::uint64_t object_lifetime_{};
 
       public:
         ObjectBase(ObjectType* object) : LuaObjectBase<ObjectType>(ObjectName::ToString(), object)
         {
+            if constexpr (!LuaObjectBase<ObjectType>::IsLocal && std::is_convertible_v<ObjectType*,Unreal::UObject*>)
+                object_lifetime_=observe_object_lifetime(object);
         }
         ObjectBase(ObjectType&& object) : LuaObjectBase<ObjectType>(ObjectName::ToString(), std::move(object))
         {
+        }
+        auto remote_object_live() const -> bool requires (!LuaObjectBase<ObjectType>::IsLocal)
+        {
+            auto* object=LuaObjectBase<ObjectType>::get_remote_cpp_object();
+            if constexpr (std::is_convertible_v<ObjectType*,Unreal::UObject*>)
+                return object_lifetime_current(object,object_lifetime_);
+            else return object && object!=LuaMadeSimple::Type::special_invalid_ptr();
+        }
+        auto get_remote_cpp_object() const -> ObjectType* requires (!LuaObjectBase<ObjectType>::IsLocal)
+        {
+            auto* object=LuaObjectBase<ObjectType>::get_remote_cpp_object();
+            if constexpr (std::is_convertible_v<ObjectType*,Unreal::UObject*>)
+                if(object && object!=LuaMadeSimple::Type::special_invalid_ptr() && !remote_object_live())
+                    throw std::runtime_error("Native object expired");
+            return object;
         }
         ObjectBase() = delete;
         virtual ~ObjectBase() = default;
@@ -760,8 +786,7 @@ Overloads:
 
             table.add_pair("IsValid", [](const LuaMadeSimple::Lua& lua) -> int {
                 const auto& lua_object = lua.get_userdata<SelfType>();
-                if (lua_object.get_remote_cpp_object() && lua_object.get_remote_cpp_object() != LuaMadeSimple::Type::special_invalid_ptr() &&
-                    is_object_in_global_unreal_object_map(lua_object.get_remote_cpp_object()) && !lua_object.get_remote_cpp_object()->IsUnreachable())
+                if (lua_object.remote_object_live() && !lua_object.get_remote_cpp_object()->IsUnreachable())
                 {
                     lua.set_bool(true);
                 }

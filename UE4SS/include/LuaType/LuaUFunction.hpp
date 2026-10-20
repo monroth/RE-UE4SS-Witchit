@@ -6,6 +6,8 @@
 #include <LuaType/LuaUObject.hpp>
 #include <LuaType/LuaUStruct.hpp>
 
+namespace RC::LuaHost { struct LuaObjectTypeAccess; }
+
 namespace RC::Unreal
 {
     class FProperty;
@@ -46,9 +48,11 @@ namespace RC::LuaType
     };
     class UFunction : public UObjectBase<Unreal::UFunction, UFunctionName>
     {
+        friend struct RC::LuaHost::LuaObjectTypeAccess;
       private:
         // This is the 'this' pointer for this UFunction
         Unreal::UObject* m_base{};
+        std::uint64_t base_lifetime_{};
 
       private:
         explicit UFunction(Unreal::UObject* base, Unreal::UFunction* function);
@@ -74,6 +78,7 @@ namespace RC::LuaType
       public:
         auto get_base() -> Unreal::UObject*
         {
+            if(m_base && !object_lifetime_current(m_base,base_lifetime_))throw std::runtime_error("Native function target expired");
             return m_base;
         }
     };

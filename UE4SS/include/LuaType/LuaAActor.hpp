@@ -3,6 +3,8 @@
 #include <LuaMadeSimple/LuaMadeSimple.hpp>
 #include <LuaType/LuaUObject.hpp>
 
+namespace RC::LuaHost { struct LuaObjectTypeAccess; }
+
 namespace RC::Unreal
 {
     class AActor;
@@ -19,6 +21,7 @@ namespace RC::LuaType
     };
     class AActor : public UObjectBase<Unreal::AActor, AActorName>
     {
+        friend struct RC::LuaHost::LuaObjectTypeAccess;
       private:
         explicit AActor(Unreal::AActor* object);
 

@@ -3,6 +3,8 @@
 #include <LuaMadeSimple/LuaObject.hpp>
 #include <LuaType/LuaUObject.hpp>
 
+namespace RC::LuaHost { struct LuaObjectTypeAccess; }
+
 namespace RC::Unreal
 {
     class UWorld;
@@ -19,6 +21,7 @@ namespace RC::LuaType
     };
     class UWorld : public RemoteObjectBase<Unreal::UWorld, UWorldName>
     {
+        friend struct RC::LuaHost::LuaObjectTypeAccess;
       private:
         explicit UWorld(Unreal::UWorld* object);
 

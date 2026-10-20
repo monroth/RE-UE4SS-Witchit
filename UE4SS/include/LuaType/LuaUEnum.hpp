@@ -2,6 +2,8 @@
 
 #include <LuaType/LuaUObject.hpp>
 
+namespace RC::LuaHost { struct LuaObjectTypeAccess; }
+
 namespace RC::Unreal
 {
     class UEnum;
@@ -18,6 +20,7 @@ namespace RC::LuaType
     };
     class UEnum : public RemoteObjectBase<Unreal::UEnum, UEnumName>
     {
+        friend struct RC::LuaHost::LuaObjectTypeAccess;
       public:
         using Super = UObject;
 

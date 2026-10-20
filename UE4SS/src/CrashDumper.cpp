@@ -77,8 +77,13 @@ namespace RC
 
     CrashDumper::~CrashDumper()
     {
-        m_set_unhandled_exception_filter_hook->unHook();
-        SetUnhandledExceptionFilter(reinterpret_cast<LPTOP_LEVEL_EXCEPTION_FILTER>(m_previous_exception_filter));
+        // A program can be destroyed before crash dumping was enabled (the
+        // standalone lifecycle gate, or a failed early program constructor).
+        if (m_set_unhandled_exception_filter_hook)
+        {
+            m_set_unhandled_exception_filter_hook->unHook();
+            SetUnhandledExceptionFilter(reinterpret_cast<LPTOP_LEVEL_EXCEPTION_FILTER>(m_previous_exception_filter));
+        }
     }
 
     void CrashDumper::enable()

@@ -14,7 +14,8 @@ target(projectName)
         add_files("src/**.cpp|Platform/**.cpp")
     end
 
-    add_deps("DynamicOutput")
+    add_deps("DynamicOutput", "Unreal")
+    add_defines("RC_UNREAL_BUILD_STATIC")
 
     if is_plat("windows") then
         if get_config("ue4ssInput") then
