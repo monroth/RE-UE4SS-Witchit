@@ -9,7 +9,6 @@
 #include <exception>
 #include <cstdint>
 #include <tuple>
-#include <Unreal/Hooks/Internal/NativeScriptScope.hpp>
 
 #include <polyhook2/Detour/x64Detour.hpp>
 #include <Unreal/Hooks/CallbackIterationData.hpp>
@@ -387,11 +386,6 @@ namespace RC::Unreal::Hook::Internal
         //                  2. Semantics of TCallbackIterationDataImpl are respected, especially where it involves the final return value.
         InHookReturnType Invoke(InArgs... Args)
         {
-            NativeScriptScope script_scope{[&]() -> FFrame* {
-                if constexpr(DetourTarget==EDetourTarget::ProcessLocalScriptFunction || DetourTarget==EDetourTarget::ProcessInternal)
-                    return &std::get<1>(std::forward_as_tuple(Args...));
-                else return nullptr;
-            }()};
             // Make the ICallbackIterationData that gets passed by reference to each callback
             TCallbackIterationData<InHookReturnType> IterationData{ DetourName };
 
@@ -406,8 +400,6 @@ namespace RC::Unreal::Hook::Internal
                     PLH::FnCast(Trampoline, TargetFunction->get_function_pointer())(Args...);
                 }
 
-                // The exact frame is exposed internally only while its POST observers run.
-                script_scope.post();
                 // Call posthook callbacks
                 InvokeCallbacks(EHookType::Post, IterationData, Args...);
                 return;
@@ -421,8 +413,6 @@ namespace RC::Unreal::Hook::Internal
                     SetOriginalFunctionCallResult(IterationData, &ReturnValue);
                 }
 
-                // The exact frame is exposed internally only while its POST observers run.
-                script_scope.post();
                 // Call posthook callbacks
                 InvokeCallbacks(EHookType::Post, IterationData, Args...);
 

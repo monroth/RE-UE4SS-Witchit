@@ -587,6 +587,11 @@ namespace RC::LuaType
 
             table.add_pair("GetOuter", [](const LuaMadeSimple::Lua& lua) -> int {
                 const auto& lua_object = lua.get_userdata<SelfType>();
+                if (!lua_object.get_remote_cpp_object())
+                {
+                    lua.set_nil();
+                    return 1;
+                }
 
                 UObject::construct(lua, lua_object.get_remote_cpp_object()->GetOuterPrivate());
 

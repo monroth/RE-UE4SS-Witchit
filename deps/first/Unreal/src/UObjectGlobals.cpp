@@ -253,10 +253,10 @@ namespace RC::Unreal::UObjectGlobals
             const bool bShortName = FPackageName::IsShortPackageName(ToCharTypePtr(InName));
             if (bAnyOuter && !bShortName)
             {
-                if (auto* Found = FUObjectHashTables::StaticFindObjectByPath(Class, ToCharTypePtr(InName), bExactClass))
-                {
-                    return Found;
-                }
+                // A full path names one object: the hash tables find it or it does not exist (yet).
+                // The scan below would walk every object for nothing (an IsA by the path of a class
+                // not loaded cost 35 ms each; Sunset Halls asked that for its 283 blocks).
+                return FUObjectHashTables::StaticFindObjectByPath(Class, ToCharTypePtr(InName), bExactClass);
             }
             else if (!bAnyOuter && bShortName)
             {

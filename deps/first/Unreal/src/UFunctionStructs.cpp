@@ -1,6 +1,4 @@
 #include <Unreal/UFunctionStructs.hpp>
-#include <Unreal/Internal/NativeWriterGate.hpp>
-#include <Unreal/Hooks/Internal/NativeScriptScope.hpp>
 #include <Unreal/UnrealInitializer.hpp>
 #include <Unreal/CoreUObject/UObject/Class.hpp>
 #include <DynamicOutput/Output.hpp>
@@ -14,44 +12,12 @@
 #include <Unreal/CoreUObject/UObject/FStrProperty.hpp>
 #include <Unreal/Hooks/Internal/CallbackOwnerBridge.hpp>
 #include <windows.h>
-#include <Unreal/Internal/WriterRecoveryStore.hpp>
 #include <set>
 #include <vector>
 #include <memory>
-#if defined(_MSC_VER)
-#include <intrin.h>
-#define UE4SS_WIR_WRITER_REGISTRATION_ORIGIN _ReturnAddress()
-#else
-#define UE4SS_WIR_WRITER_REGISTRATION_ORIGIN __builtin_extract_return_addr(__builtin_return_address(0))
-#endif
-#if defined(UE4SS_CAULDRON_ROUNDTRIP_DIAGNOSTIC)
-#include <Unreal/Internal/WitchItMetadataPayload.hpp>
-#endif
-#include "WitchItWriterTransaction.inl"
 
 namespace RC::Unreal
 {
-    thread_local Hook::Internal::NativeScriptScope* Hook::Internal::NativeScriptScope::current_{};
-    thread_local std::uint64_t Hook::Internal::NativeScriptScope::next_{};
-    auto Hook::Internal::CurrentWitchItStoreStaticsSerial() noexcept -> std::uint64_t {
-        return Hook::Internal::CurrentWitchItStoreStaticsFrame() ? NativeScriptScope::current_->serial_ : 0;
-    }
-    auto Hook::Internal::CurrentWitchItStoreStaticsFrame() noexcept -> FFrame* {
-        auto* scope=NativeScriptScope::current_;
-        if(!scope || !scope->post_ || !scope->frame_ || !IsInGameThreadRaw())return nullptr;
-        try {
-            auto* frame=scope->frame_;
-            return frame->Node() && frame->Node()->GetPathName()==STR("/Game/Blueprints/Match/BFL_MapLayoutLoading.BFL_MapLayoutLoading_C:StoreStatics")
-                ? frame : nullptr;
-        } catch(...) {return nullptr;}
-    }
-    thread_local Internal::NativeWriterGate* Internal::NativeWriterGate::current_{};
-    auto UnrealScriptFunctionCallableContext::DenyNativeWriterCall() noexcept -> bool {
-        return Internal::NativeWriterGate::deny(this);
-    }
-    auto Internal::DenyNativeWriterCallForCaller(const FFrame* Caller) noexcept -> bool {
-        return Internal::NativeWriterGate::deny(nullptr,Caller);
-    }
     std::atomic<CallbackId> UnrealScriptFunctionData::HookIndexCounter{1};
 
     UnrealScriptFunctionData::UnrealScriptFunctionData(UnrealScriptFunction OriginalFuncPtr) {
@@ -316,14 +282,6 @@ namespace RC::Unreal
                 UnrealScriptFunctionCallableContext FuncContext(Context, *NewStackPtr, RESULT_DECL);
                 
                 Iterator->second.bIsMidExecution = true;
-                const auto writer_path=FunctionBeingExecuted->GetPathName();
-                const bool exact_writer=writer_path==STR("/Script/PropWitchHuntModule.ProjectVersionBlueprint:SavePropLayoutToFile")
-                    || writer_path==STR("/Script/PropWitchHuntModule.ProjectVersionBlueprint:SavePropLayoutToFileCompressed");
-                auto writer_result=exact_writer ? CastField<FBoolProperty>(FunctionBeingExecuted->GetReturnProperty()) : nullptr;
-                Internal::NativeWriterGate writer_gate{&FuncContext,NewStackPtr->PreviousFrame(),exact_writer && writer_result && RESULT_DECL && IsInGameThreadRaw()};
-                Internal::NativeWriterTransactionScope writer_scope{&FuncContext};
-                const auto original_function=Iterator->second.GetOriginalFuncPtr();
-
                 try
                 {
                     // Fire pre callbacks with all parameters now properly populated
@@ -331,64 +289,21 @@ namespace RC::Unreal
                 }
                 catch (std::exception& e)
                 {
-                    Output::send(STR("Error executing hook pre-callback {}: {}\n"), 
+                    Output::send(STR("Error executing hook pre-callback {}: {}\n"),
                                  FunctionBeingExecuted->GetPathName(), ensure_str(e.what()));
                 }
-                catch (...)
-                {
-                    if(!exact_writer)throw;
-                    Output::send(STR("Error executing WitchIt writer pre-callback: unknown exception\n"));
-                }
 
-                // Recheck after ALL PRE observers; serialize only initialized
-                // host-owned inputs into the reserved temporary destination.
-                if(writer_scope.transaction_ && !writer_scope.transaction_->before())(void)FuncContext.DenyNativeWriterCall();
-                bool native_writer_success=false,post_observers_ok=true;
-                const bool writer_denied=writer_gate.denied();
-                if(!writer_denied) {
-                    try {
-                        if(writer_scope.transaction_)writer_scope.transaction_->serialize(original_function);
-                        else if(writer_scope.input_copy_)writer_scope.input_copy_->serialize(original_function);
-                        else original_function(Context,*NewStackPtr,RESULT_DECL);
-                        native_writer_success=exact_writer && writer_result && RESULT_DECL && writer_result->GetPropertyValue(RESULT_DECL);
-                    } catch(...) {
-                        if(exact_writer){(void)FuncContext.DenyNativeWriterCall();if(writer_result && RESULT_DECL)writer_result->SetPropertyValue(RESULT_DECL,false);}
-                        else throw;
-                    }
-                } else if(writer_result && RESULT_DECL)writer_result->SetPropertyValue(RESULT_DECL,false);
-                writer_gate.post();writer_scope.pre_=false;
-                
+                Iterator->second.GetOriginalFuncPtr()(Context, *NewStackPtr, RESULT_DECL);
+
                 try
                 {
-                    // POST observers (including FAPP's marker-count cache) see
-                    // the same owned inputs the native serializer just received.
-                    auto post_callbacks=[&] {
-                        if(auto current=FunctionMap.find(FunctionBeingExecuted);current!=FunctionMap.end())current->second.FirePostCallbacks(FuncContext);
-                        else post_observers_ok=false;
-                    };
-                    if(writer_scope.input_copy_)writer_scope.input_copy_->observe(post_callbacks);
-                    else post_callbacks();
+                    // (a PRE callback may have removed hooks: the entry is looked up again)
+                    if (auto current = FunctionMap.find(FunctionBeingExecuted); current != FunctionMap.end()) current->second.FirePostCallbacks(FuncContext);
                 }
                 catch (std::exception& e)
                 {
-                    post_observers_ok=false;
-                    Output::send(STR("Error executing hook post-callback {}: {}\n"), 
+                    Output::send(STR("Error executing hook post-callback {}: {}\n"),
                                  FunctionBeingExecuted->GetPathName(), ensure_str(e.what()));
-                }
-
-                // A POST observer cannot turn an intentionally skipped writer
-                // into success. No original disk write happened in this scope.
-                if((writer_denied || writer_gate.denied()) && writer_result && RESULT_DECL)writer_result->SetPropertyValue(RESULT_DECL,false);
-
-                if(writer_scope.transaction_) {
-                    const bool observed=post_observers_ok && RESULT_DECL && writer_result->GetPropertyValue(RESULT_DECL);
-                    const bool result=writer_scope.transaction_->finalize(native_writer_success,observed,writer_gate.denied());
-                    if(RESULT_DECL)writer_result->SetPropertyValue(RESULT_DECL,result);
-                } else if(writer_scope.completion_ && writer_result && RESULT_DECL) {
-                    bool result=native_writer_success && !writer_gate.denied() && post_observers_ok && writer_result->GetPropertyValue(RESULT_DECL);
-                    const bool actual=result;
-                    try{(void)writer_scope.completion_->Invoke(FuncContext,WitchItWriterPhase::Complete,result);}catch(...){}
-                    writer_result->SetPropertyValue(RESULT_DECL,actual);
                 }
 
                 // Copy out parameter values back to the original frame

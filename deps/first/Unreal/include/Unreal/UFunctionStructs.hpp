@@ -15,22 +15,6 @@ namespace RC::Unreal
     using UnrealScriptFunction = void(*)(UObject* Context, FFrame& TheStack, void* RESULT_DECL);
     using CallbackId = int32_t;
     static constexpr CallbackId InvalidCallbackId = -1;
-    enum class WitchItWriterPhase { BeforeSerialize, BeforePublish, Complete };
-    enum class WitchItPublicationState { NotPublished, Committed, RolledBack, Uncertain };
-    enum class WitchItRecoveryState { Unavailable, Ready, Writing, Uncertain };
-    struct WitchItRecoverySnapshot {
-        WitchItRecoveryState state{WitchItRecoveryState::Unavailable};
-        std::string session,incident,target,source,resolved,proof;
-        std::uint64_t revision{},serial{},generation{};
-    };
-    auto RC_UE_API InitializeWitchItWriterRecovery() noexcept -> bool;
-    // Cached-only queries: no disk scan on status, frame or Lua heartbeat.
-    auto RC_UE_API GetWitchItWriterRecoverySnapshot(WitchItRecoverySnapshot&) noexcept -> bool;
-    auto RC_UE_API ResolveWitchItRestoredOriginal(const std::string& Incident,std::uint64_t Revision) noexcept -> bool;
-    auto RC_UE_API VerifyWitchItWriterRecoveryResolution(const std::string& Incident,const std::string& Session,std::uint64_t Revision,const std::string& Proof) noexcept -> bool;
-    auto RC_UE_API VerifyWitchItWriterRecoveryReady(const std::string& Session,std::uint64_t Revision) noexcept -> bool;
-    // Host-owned unresolved receipts survive Native consumer/VM retirement.
-    auto RC_UE_API GetWitchItUnresolvedWrite(StringType& Target,StringType& Backup) noexcept -> bool;
 
     class RC_UE_API UnrealScriptFunctionCallableContext
     {
@@ -42,17 +26,6 @@ namespace RC::Unreal
         CallbackId CallableId{InvalidCallbackId};
 
         UnrealScriptFunctionCallableContext(UObject* Context, FFrame& TheStack, void* RESULT_DECL);
-
-        // Only the physical native PRE context, and only the two exact bool
-        // WitchIt layout writers. Context layout/vtable remain unchanged.
-        auto DenyNativeWriterCall() noexcept -> bool;
-        using WitchItWriterValidator=std::function<void(UnrealScriptFunctionCallableContext&,WitchItWriterPhase,bool&)>;
-        auto UseWitchItWriterStatics(const void* ExpectedStatics,const void* OwnedStatics) -> bool;
-        auto PrepareWitchItWriter(const void* ExpectedStatics,const void* OwnedStatics,const WitchItWriterValidator&,std::uint64_t Serial,std::uint64_t Generation) -> bool;
-        // Called only inside the managed final validator, after the host has
-        // validated the temporary native file and all POST observers completed.
-        auto CommitWitchItWriterFile() noexcept -> bool;
-        auto GetWitchItWriterOutcome(WitchItPublicationState&,StringType& Target,StringType& Backup) const noexcept -> bool;
 
         template<typename ReturnType>
         auto SetReturnValue(ReturnType NewValue) -> void
@@ -115,9 +88,6 @@ namespace RC::Unreal
         auto RC_UE_API GetHookedFunctionsMap() -> HookedUFunctionMap&;
 
         auto UnrealScriptFunctionHook(UObject* Context, FFrame& TheStack, void* RESULT_DECL) -> void;
-        // Caller is an exact still-live SaveLayout frame held by its producer;
-        // no frame or context pointer is ever returned to Lua.
-        auto RC_UE_API DenyNativeWriterCallForCaller(const FFrame* Caller) noexcept -> bool;
     }
 }
 

@@ -385,15 +385,27 @@ namespace RC::LuaType
         }
     }
 
+    // An empty object (a null pointer behind the userdata) has no name or class: nil, as GetFullName
+    // gives; reading them read address 0x18 / 0x10 and ended the game (Witch It+ 11-19, a frame's picture).
     auto construct_fname(const LuaMadeSimple::Lua& lua) -> void
     {
         const auto& lua_object = lua.get_userdata<UObject>();
+        if (!lua_object.get_remote_cpp_object())
+        {
+            lua.set_nil();
+            return;
+        }
         LuaType::FName::construct(lua, lua_object.get_remote_cpp_object()->GetNamePrivate());
     }
 
     auto construct_uclass(const LuaMadeSimple::Lua& lua) -> void
     {
         const auto& lua_object = lua.get_userdata<UObject>();
+        if (!lua_object.get_remote_cpp_object())
+        {
+            lua.set_nil();
+            return;
+        }
         LuaType::UClass::construct(lua, lua_object.get_remote_cpp_object()->GetClassPrivate());
     }
 
